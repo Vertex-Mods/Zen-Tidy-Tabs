@@ -1,0 +1,234 @@
+@keyframes brush-sweep {
+  0% {
+    transform: rotate(0deg);
+  }
+
+  20% {
+    transform: rotate(-15deg);
+  }
+
+  40% {
+    transform: rotate(15deg);
+  }
+
+  60% {
+    transform: rotate(-15deg);
+  }
+
+  80% {
+    transform: rotate(15deg);
+  }
+
+  100% {
+    transform: rotate(0deg);
+  }
+}
+
+@keyframes arrow-pulse {
+  0% {
+    transform: scale(1);
+  }
+
+  50% {
+    transform: scale(1.2);
+  }
+
+  100% {
+    transform: scale(1);
+  }
+}
+
+@keyframes loading-pulse-tab {
+  0%,
+  100% {
+    opacity: 0.6;
+  }
+
+  50% {
+    opacity: 1;
+  }
+}
+
+.pinned-tabs-container-separator {
+  background: none !important;
+  height: 16px !important;
+  max-height: none !important;
+  display: flex !important;
+  flex-direction: row !important;
+  align-items: center !important;
+  justify-content: flex-end !important;
+  overflow: visible !important;
+  border: none !important;
+  width: 93% !important;
+  box-sizing: border-box !important;
+  gap: 0;
+  margin: 1px 0 1px 6.5px !important;
+
+  & svg {
+    width: 100% !important;
+    height: 1px;
+    min-height: 1px !important;
+    display: block;
+    overflow: visible;
+    transition: width 0.15s ease-in-out;
+    min-width: 0;
+    margin-right: 0;
+    flex-grow: 1;
+  }
+
+  & #sort-button,
+  & #clear-button {
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    font-size: 11px !important;
+    width: 45px !important;
+    appearance: none !important;
+    border-radius: 4px !important;
+    flex-shrink: 0;
+    min-width: 0;
+    max-width: 0;
+    opacity: 0;
+    overflow: hidden;
+    pointer-events: none;
+    margin: 0 !important;
+    padding: 0 !important;
+    white-space: nowrap;
+    color: rgba(255, 255, 255, 0.6) !important;
+
+    & label {
+      display: block;
+      font-weight: 600;
+    }
+
+    & .toolbarbutton-text {
+      margin-left: 1px !important;
+    }
+
+    &:hover {
+      background-color: var(--tab-selected-bgcolor) !important;
+      color: white;
+    }
+
+    &.hidden-button {
+      display: none !important;
+      pointer-events: none !important;
+      opacity: 0 !important;
+      max-width: 0 !important;
+      margin: 0 !important;
+      padding: 0 !important;
+    }
+  }
+
+  & #sort-button {
+    & .broom-icon {
+      width: 12px !important;
+      height: 12px !important;
+      margin-right: 2px !important;
+      fill: currentColor !important;
+    }
+
+    &.brushing .broom-icon {
+      animation: brush-sweep 0.8s ease-in-out;
+      transform-origin: 50% 50%;
+    }
+  }
+
+  & #clear-button {
+    & .arrow-icon {
+      width: 12px !important;
+      height: 12px !important;
+      margin-right: 2px !important;
+      stroke: currentColor !important;
+    }
+
+    &.clearing .arrow-icon {
+      animation: arrow-pulse 0.6s ease-in-out;
+    }
+  }
+
+  &:hover {
+    & #clear-button {
+      max-width: 45px !important;
+      opacity: 1;
+      pointer-events: auto;
+      padding: 1px 4px !important;
+      margin-left: 2px !important;
+      cursor: pointer !important;
+    }
+
+    & #sort-button {
+      max-width: 18px !important;
+      opacity: 1;
+      pointer-events: auto;
+      padding: 1px 0px 1px 3px !important;
+      margin-left: 6px !important;
+      cursor: pointer !important;
+    }
+  }
+
+  &.has-no-sortable-tabs {
+    max-height: 0 !important;
+    margin: 0 auto !important;
+    padding: 0 !important;
+    border: none !important;
+    overflow: hidden !important;
+    gap: 0 !important;
+
+    & svg,
+    & #sort-button,
+    & #clear-button {
+      display: none !important;
+      width: 0 !important;
+      opacity: 0 !important;
+    }
+  }
+}
+
+#vertical-pinned-tabs-container
+  .zen-workspace-tabs-section[hide-separator]
+  .pinned-tabs-container-separator {
+  max-height: 0 !important;
+  margin: 0 auto !important;
+  padding: 0 !important;
+  border: none !important;
+  overflow: hidden !important;
+  gap: 0 !important;
+}
+
+.vertical-pinned-tabs-container-separator:hover svg {
+  width: calc(
+    100% -
+      (
+        100px *
+          (1 - (var(--sort-button-hidden, 0) * var(--clear-button-hidden, 0)))
+      )
+  ) !important;
+}
+
+.tab-is-sorting {
+  & .tab-icon-image,
+  & .tab-label {
+    animation: loading-pulse-tab 1.5s ease-in-out infinite;
+    will-change: opacity;
+  }
+}
+
+.separator-path-segment {
+  stroke: rgba(255, 255, 255, 0.3);
+}
+
+[lwt-toolbar="light"] {
+  & #sort-button,
+  & #clear-button {
+    color: rgba(0, 0, 0, 0.6);
+
+    &:hover {
+      color: black;
+    }
+  }
+
+  & .separator-path-segment {
+    stroke: rgba(0, 0, 0, 0.2);
+  }
+}
