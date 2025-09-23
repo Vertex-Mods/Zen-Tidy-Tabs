@@ -8,7 +8,7 @@
   const CONFIG = {
     SIMILARITY_THRESHOLD: 0.45,
     GROUP_SIMILARITY_THRESHOLD: 0.75,
-    MIN_TABS_FOR_SORT: 6,
+    MIN_TABS_FOR_SORT: 6, // This is the ammount of tabs for the button to show, not the ammount of tabs you need in a group
     DEBOUNCE_DELAY: 250,
     ANIMATION_DURATION: 800,
     CLEAR_ANIMATION_DURATION: 600,
@@ -23,6 +23,7 @@
   let isClearing = false;
   let sortButtonListenerAdded = false;
   let clearButtonListenerAdded = false;
+  let isPlayingFailureAnimation = false;
   let sortAnimationId = null;
   let eventListenersAdded = false;
 
@@ -654,6 +655,11 @@
 
   // Animation cleanup utility
   const cleanupAnimation = () => {
+    // Don't cleanup if failure animation is playing
+    if (isPlayingFailureAnimation) {
+      return;
+    }
+
     if (sortAnimationId !== null) {
       cancelAnimationFrame(sortAnimationId);
       sortAnimationId = null;
@@ -669,6 +675,88 @@
       } catch (resetError) {
         console.error("Error resetting animation:", resetError);
       }
+    }
+  };
+
+  // Spiky failure animation utility
+  const startFailureAnimation = () => {
+    if (sortAnimationId !== null) {
+      cancelAnimationFrame(sortAnimationId);
+    }
+
+    isPlayingFailureAnimation = true;
+
+    try {
+      const activeSeparator = document.querySelector(
+        ".pinned-tabs-container-separator:not(.has-no-sortable-tabs)"
+      );
+      const pathElement = activeSeparator?.querySelector("#separator-path");
+
+      if (pathElement) {
+        const maxAmplitude = 8; // Much higher amplitude for spiky effect
+        const frequency = 20; // Higher frequency for more spikes
+        const segments = 100; // More segments for sharper spikes
+        const pulseDuration = 400; // Duration of each pulse
+        const totalPulses = 3; // Number of pulses
+        let currentPulse = 0;
+        let t = 0;
+        let startTime = performance.now();
+        let pulseStartTime = startTime;
+
+        function animateFailureLoop(timestamp) {
+          if (sortAnimationId === null) return;
+
+          const elapsedSincePulseStart = timestamp - pulseStartTime;
+          const pulseProgress = elapsedSincePulseStart / pulseDuration;
+
+          if (pulseProgress >= 1) {
+            currentPulse++;
+            if (currentPulse >= totalPulses) {
+              // Animation complete, reset to straight line
+              pathElement.setAttribute("d", "M 0 1 L 100 1");
+              sortAnimationId = null;
+              isPlayingFailureAnimation = false;
+              return;
+            }
+            // Start next pulse
+            pulseStartTime = timestamp;
+          }
+
+          // Create spiky wave with sharp peaks and valleys
+          const currentProgress = Math.min(pulseProgress, 1);
+          const intensity = Math.sin(currentProgress * Math.PI); // Pulse intensity (0 to 1 to 0)
+          const currentAmplitude = maxAmplitude * intensity;
+
+          t += 1.2; // Faster animation speed
+
+          const points = [];
+          for (let i = 0; i <= segments; i++) {
+            const x = (i / segments) * 100;
+            // Create sharp spikes using a combination of sine waves
+            const baseWave = Math.sin(
+              (x / (100 / frequency)) * 2 * Math.PI + t * 0.15
+            );
+            const sharpWave =
+              Math.sign(baseWave) * Math.pow(Math.abs(baseWave), 0.3); // Sharp peaks
+            const y = 1 + currentAmplitude * sharpWave;
+            points.push(`${x.toFixed(2)},${y.toFixed(2)}`);
+          }
+
+          if (pathElement?.isConnected) {
+            const pathData = "M" + points.join(" L");
+            pathElement.setAttribute("d", pathData);
+            sortAnimationId = requestAnimationFrame(animateFailureLoop);
+          } else {
+            sortAnimationId = null;
+            isPlayingFailureAnimation = false;
+          }
+        }
+
+        sortAnimationId = requestAnimationFrame(animateFailureLoop);
+      }
+    } catch (error) {
+      console.error("Error in failure animation:", error);
+      isPlayingFailureAnimation = false;
     }
   };
 
@@ -742,13 +830,27 @@
         return !isInGroupInCorrectWorkspace;
       });
 
+      console.log(
+        "[TabSort] Debug - Initial tabs to sort count:",
+        initialTabsToSort.length
+      );
       if (initialTabsToSort.length === 0) {
+        console.log("[TabSort] Debug - No tabs to sort, returning early");
         return;
       }
 
       // --- AI Grouping ---
-
+      console.log(
+        "[TabSort] Debug - Starting AI grouping for",
+        initialTabsToSort.length,
+        "tabs"
+      );
       const aiTabTopics = await askAIForMultipleTopics(initialTabsToSort);
+      console.log(
+        "[TabSort] Debug - AI returned",
+        aiTabTopics.length,
+        "tab-topic pairs"
+      );
       // --- End AI Grouping ---
 
       // --- Create Final Groups ---
@@ -831,7 +933,41 @@
 
       // --- End Consolidation ---
 
+      // Check if sorting failed (no groups created from sortable tabs)
+      // Count groups with more than 1 tab (single tab groups are not considered successful sorting)
+      const multiTabGroups = Object.values(finalGroups).filter(
+        (tabs) => tabs.length > 1
+      );
+      const sortingFailed =
+        multiTabGroups.length === 0 && initialTabsToSort.length > 1;
+
+      console.log(
+        "[TabSort] Debug - Initial tabs to sort:",
+        initialTabsToSort.length
+      );
+      console.log("[TabSort] Debug - Final groups:", Object.keys(finalGroups));
+      console.log("[TabSort] Debug - Multi-tab groups:", multiTabGroups.length);
+      console.log(
+        "[TabSort] Debug - multiTabGroups.length === 0:",
+        multiTabGroups.length === 0
+      );
+      console.log(
+        "[TabSort] Debug - initialTabsToSort.length > 1:",
+        initialTabsToSort.length > 1
+      );
+      console.log("[TabSort] Debug - Sorting failed:", sortingFailed);
+
+      if (sortingFailed) {
+        console.log("[TabSort] Triggering failure animation");
+        // Trigger failure animation
+        startFailureAnimation();
+        return;
+      }
+
       if (Object.keys(finalGroups).length === 0) {
+        console.log(
+          "[TabSort] Debug - No final groups, returning early (this should not happen after failure detection)"
+        );
         return;
       }
 
@@ -989,38 +1125,75 @@
     } catch (error) {
       console.error("Error during overall sorting process:", error);
     } finally {
-      isSorting = false;
+      // If failure animation is playing, delay the cleanup
+      if (isPlayingFailureAnimation) {
+        // Wait for failure animation to complete (3 pulses * 400ms each + buffer)
+        setTimeout(() => {
+          isSorting = false;
+          cleanupAnimation();
 
-      // Cleanup animation
-      cleanupAnimation();
+          // Remove separator pulse indicator
+          if (separatorsToSort.length > 0) {
+            batchDOMUpdates([
+              () =>
+                separatorsToSort.forEach((sep) => {
+                  if (sep?.isConnected) {
+                    sep.classList.remove("separator-is-sorting");
+                  }
+                }),
+            ]);
+          }
 
-      // Remove separator pulse indicator
-      if (separatorsToSort.length > 0) {
-        batchDOMUpdates([
-          () =>
-            separatorsToSort.forEach((sep) => {
-              if (sep?.isConnected) {
-                sep.classList.remove("separator-is-sorting");
-              }
-            }),
-        ]);
-      }
-
-      // Remove tab loading indicators and update button visibility
-      setTimeout(() => {
-        batchDOMUpdates([
-          () => {
-            if (typeof gBrowser !== "undefined" && gBrowser.tabs) {
-              Array.from(gBrowser.tabs).forEach((tab) => {
-                if (tab?.isConnected) {
-                  tab.classList.remove("tab-is-sorting");
+          // Remove tab loading indicators and update button visibility
+          setTimeout(() => {
+            batchDOMUpdates([
+              () => {
+                if (typeof gBrowser !== "undefined" && gBrowser.tabs) {
+                  Array.from(gBrowser.tabs).forEach((tab) => {
+                    if (tab?.isConnected) {
+                      tab.classList.remove("tab-is-sorting");
+                    }
+                  });
                 }
-              });
-            }
-          },
-        ]);
-        updateButtonsVisibilityState();
-      }, 500);
+              },
+            ]);
+            updateButtonsVisibilityState();
+          }, 500);
+        }, 1500); // 3 pulses * 400ms + 300ms buffer
+      } else {
+        isSorting = false;
+
+        // Cleanup animation
+        cleanupAnimation();
+
+        // Remove separator pulse indicator
+        if (separatorsToSort.length > 0) {
+          batchDOMUpdates([
+            () =>
+              separatorsToSort.forEach((sep) => {
+                if (sep?.isConnected) {
+                  sep.classList.remove("separator-is-sorting");
+                }
+              }),
+          ]);
+        }
+
+        // Remove tab loading indicators and update button visibility
+        setTimeout(() => {
+          batchDOMUpdates([
+            () => {
+              if (typeof gBrowser !== "undefined" && gBrowser.tabs) {
+                Array.from(gBrowser.tabs).forEach((tab) => {
+                  if (tab?.isConnected) {
+                    tab.classList.remove("tab-is-sorting");
+                  }
+                });
+              }
+            },
+          ]);
+          updateButtonsVisibilityState();
+        }, 500);
+      }
     }
   };
 
@@ -1047,25 +1220,34 @@
 
       if (tabsToClose.length === 0) return;
 
-      // Close the tabs in reverse order to avoid index shifting issues
-      const reversedTabs = [...tabsToClose].reverse();
+      // Close all tabs simultaneously using gBrowser.removeTabs for proper animation
+      try {
+        // Filter out any invalid tabs
+        const validTabsToClose = tabsToClose.filter((tab) => tab?.isConnected);
 
-      batchDOMUpdates([
-        () => {
-          reversedTabs.forEach((tab) => {
-            try {
-              if (
-                tab?.isConnected &&
-                typeof gBrowser?.removeTab === "function"
-              ) {
-                gBrowser.removeTab(tab);
-              }
-            } catch (e) {
-              console.error("Error closing tab:", e);
-            }
+        if (validTabsToClose.length > 0) {
+          // Use gBrowser.removeTabs for simultaneous closing with animation
+          gBrowser.removeTabs(validTabsToClose, {
+            animate: true, // Enable animation for smooth closing
+            skipSessionStore: false, // Keep session store for tab restoration if needed
           });
-        },
-      ]);
+        }
+      } catch (e) {
+        console.error(
+          "Error closing tabs with removeTabs, falling back to individual removeTab:",
+          e
+        );
+        // Fallback to original method if removeTabs fails
+        tabsToClose.forEach((tab) => {
+          try {
+            if (tab?.isConnected && typeof gBrowser?.removeTab === "function") {
+              gBrowser.removeTab(tab);
+            }
+          } catch (fallbackError) {
+            console.error("Error in fallback tab closing:", fallbackError);
+          }
+        });
+      }
     } catch (error) {
       console.error("Error during tab clearing process:", error);
     } finally {
@@ -1557,6 +1739,7 @@
           setupgZenWorkspacesHooks();
           updateButtonsVisibilityState();
           addTabEventListeners();
+
           return true;
         }
       } catch (e) {
