@@ -4,8 +4,10 @@
   "description": "Sort your tabs using Firefox's local AI but make it look awesome!",
   "js": true,
   "homepage": "https://github.com/Vertex-Mods/Zen-Tidy-Tabs",
-  "style": "https://raw.githubusercontent.com/Vertex-Mods/Zen-Tidy-Tabs/main/userChrome.css",
-  "preferences": "https://raw.githubusercontent.com/Vertex-Mods/Zen-Tidy-Tabs/main/preferences.json",
+  "style": {
+    "chrome": "userChrome.css"
+  },
+  "preferences": "preferences.json",
   "readme": "https://raw.githubusercontent.com/Vertex-Mods/Zen-Tidy-Tabs/main/README.md",
   "image": "https://raw.githubusercontent.com/Vertex-Mods/Zen-Tidy-Tabs/main/image.png",
   "author": "Vertex",
