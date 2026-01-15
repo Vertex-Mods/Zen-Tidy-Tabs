@@ -24,20 +24,6 @@
   }
 }
 
-@keyframes arrow-pulse {
-  0% {
-    transform: scale(1);
-  }
-
-  50% {
-    transform: scale(1.2);
-  }
-
-  100% {
-    transform: scale(1);
-  }
-}
-
 @keyframes loading-pulse-tab {
   0%,
   100% {
@@ -50,19 +36,8 @@
 }
 
 .pinned-tabs-container-separator {
-  background: none !important;
-  height: 16px !important;
-  max-height: none !important;
-  display: flex !important;
-  flex-direction: row !important;
-  align-items: center !important;
-  justify-content: flex-end !important;
+  /* Only override what's necessary, let native styles handle layout */
   overflow: visible !important;
-  border: none !important;
-  width: 93% !important;
-  box-sizing: border-box !important;
-  gap: 0;
-  margin: 1px 0 1px 6.5px !important;
 
   & svg {
     width: 100% !important;
@@ -72,29 +47,31 @@
     overflow: visible;
     transition: width 0.15s ease-in-out;
     min-width: 0;
-    margin-right: 0;
+    margin: auto 4px !important;
     flex-grow: 1;
   }
 
-  & #sort-button,
-  & #clear-button {
-    display: flex !important;
-    align-items: center !important;
-    justify-content: center !important;
-    font-size: 11px !important;
-    width: 45px !important;
+  & #sort-button {
     appearance: none !important;
-    border-radius: 4px !important;
+    opacity: 0;
+    visibility: collapse;
+    transition:
+      opacity 0.15s,
+      visibility 0.15s;
+    font-size: 10px !important;
+    font-weight: 500;
+    gap: 2px;
     flex-shrink: 0;
     min-width: 0;
-    max-width: 0;
-    opacity: 0;
     overflow: hidden;
     pointer-events: none;
     margin: 0 !important;
     padding: 0 !important;
     white-space: nowrap;
-    color: rgba(255, 255, 255, 0.6) !important;
+    /* Don't hardcode color - let it inherit from theme like native clear button */
+    /* Match native clear button context properties for icon color */
+    -moz-context-properties: fill, fill-opacity !important;
+    fill: currentColor !important;
 
     & label {
       display: block;
@@ -102,68 +79,70 @@
     }
 
     & .toolbarbutton-text {
-      margin-left: 1px !important;
+      display: flex;
     }
 
-    &:hover {
-      background-color: var(--tab-selected-bgcolor) !important;
-      color: white;
-    }
-
-    &.hidden-button {
-      display: none !important;
-      pointer-events: none !important;
-      opacity: 0 !important;
-      max-width: 0 !important;
-      margin: 0 !important;
-      padding: 0 !important;
-    }
-  }
-
-  & #sort-button {
     & .broom-icon {
-      width: 12px !important;
-      height: 12px !important;
-      margin-right: 2px !important;
+      width: 10px !important;
+      height: 10px !important;
+      transition: transform 0.15s ease-in-out;
+      transform: translateY(0px);
+      /* Use currentColor to match native clear button icon color */
       fill: currentColor !important;
+    }
+
+    & .broom-icon path {
+      /* Use currentColor so it adapts to theme changes like native button */
+      fill: currentColor !important;
+    }
+
+    @starting-style {
+      & .broom-icon {
+        transform: translateY(-2px);
+      }
+    }
+
+    &:active:hover .broom-icon {
+      transform: translateY(2px);
     }
 
     &.brushing .broom-icon {
       animation: brush-sweep 0.8s ease-in-out;
       transform-origin: 50% 50%;
     }
-  }
 
-  & #clear-button {
-    & .arrow-icon {
-      width: 12px !important;
-      height: 12px !important;
-      margin-right: 2px !important;
-      stroke: currentColor !important;
+    #navigator-toolbox[zen-has-implicit-hover="true"] & {
+      visibility: visible;
+      opacity: 0.5;
     }
 
-    &.clearing .arrow-icon {
-      animation: arrow-pulse 0.6s ease-in-out;
+    &:hover {
+      opacity: 1 !important;
+    }
+
+    :root:not([zen-sidebar-expanded="true"]) & {
+      display: none;
+    }
+
+    &.hidden-button {
+      display: none !important;
+      pointer-events: none !important;
+      opacity: 0 !important;
+      margin: 0 !important;
+      padding: 0 !important;
     }
   }
 
   &:hover {
-    & #clear-button {
-      max-width: 45px !important;
-      opacity: 1;
+    & #sort-button {
+      visibility: visible;
+      opacity: 0.5;
       pointer-events: auto;
-      padding: 1px 4px !important;
-      margin-left: 2px !important;
       cursor: pointer !important;
     }
 
-    & #sort-button {
-      max-width: 18px !important;
-      opacity: 1;
-      pointer-events: auto;
-      padding: 1px 0px 1px 3px !important;
-      margin-left: 6px !important;
-      cursor: pointer !important;
+    & #sort-button:hover {
+      opacity: 1 !important;
     }
   }
 
@@ -176,8 +155,7 @@
     gap: 0 !important;
 
     & svg,
-    & #sort-button,
-    & #clear-button {
+    & #sort-button {
       display: none !important;
       width: 0 !important;
       opacity: 0 !important;
@@ -201,7 +179,7 @@
     100% -
       (
         100px *
-          (1 - (var(--sort-button-hidden, 0) * var(--clear-button-hidden, 0)))
+          (1 - var(--sort-button-hidden, 0))
       )
   ) !important;
 }
@@ -215,12 +193,12 @@
 }
 
 .separator-path-segment {
-  stroke: rgba(255, 255, 255, 0.3);
+  /* Use light-dark() to adapt to theme like native toolbarseparator */
+  stroke: light-dark(rgba(0, 0, 0, 0.1), rgba(255, 255, 255, 0.1)) !important;
 }
 
 [lwt-toolbar="light"] {
-  & #sort-button,
-  & #clear-button {
+  & #sort-button {
     color: rgba(0, 0, 0, 0.6);
 
     &:hover {
@@ -229,6 +207,13 @@
   }
 
   & .separator-path-segment {
-    stroke: rgba(0, 0, 0, 0.2);
+    /* Match native toolbarseparator color for light theme */
+    stroke: rgba(0, 0, 0, 0.1) !important;
+  }
+}
+
+.pinned-tabs-container-separator {
+  & toolbarseparator {
+    display: none !important;
   }
 }
