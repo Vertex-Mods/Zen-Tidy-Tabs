@@ -4,8 +4,6 @@
 // @description    sorts tab and arrange them into tab groups
 // ==/UserScript==
 
-const UC_API = ChromeUtils.importESModule("chrome://userchromejs/content/uc_api.sys.mjs");
-
 (() => {
   const CONFIG = {
     SIMILARITY_THRESHOLD: 0.45,
