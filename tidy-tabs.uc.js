@@ -1121,6 +1121,72 @@ const UC_API = ChromeUtils.importESModule("chrome://userchromejs/content/uc_api.
           }
         }
       } // End loop through final groups
+
+      // --- Reorder tabs: groups first, then ungrouped tabs ---
+      try {
+        const workspaceElement = gZenWorkspaces?.activeWorkspaceElement;
+        
+        if (workspaceElement?.tabsContainer) {
+          const tabsContainer = workspaceElement.tabsContainer;
+          const allChildren = Array.from(tabsContainer.children);
+          
+          // Separate groups and ungrouped tabs
+          // Since we're in the workspace's tabsContainer, all direct children belong to this workspace
+          const groups = [];
+          const ungroupedTabs = [];
+          const otherElements = []; // For any other elements (like periphery hbox)
+          
+          for (const child of allChildren) {
+            const tagName = child.tagName?.toLowerCase();
+            if (tagName === "tab-group") {
+              // All tab-groups in this container belong to the workspace
+              groups.push(child);
+            } else if (tagName === "tab") {
+              // Check if tab is valid (not empty, not glance)
+              if (
+                !child.hasAttribute("zen-empty-tab") &&
+                !child.hasAttribute("zen-glance-tab")
+              ) {
+                ungroupedTabs.push(child);
+              } else {
+                otherElements.push(child);
+              }
+            } else {
+              // Other elements (like hbox periphery)
+              otherElements.push(child);
+            }
+          }
+          
+          console.log("[TabSort] Reorder - groups:", groups.length, "ungrouped:", ungroupedTabs.length);
+          
+          // Only reorder if we have both groups AND ungrouped tabs
+          if (groups.length > 0 && ungroupedTabs.length > 0) {
+            console.log("[TabSort] Reorder - Moving ungrouped tabs below groups...");
+            
+            // Move each ungrouped tab to after the last group
+            const lastGroup = groups[groups.length - 1];
+            let insertAfterElement = lastGroup;
+            
+            ungroupedTabs.forEach((tab) => {
+              if (tab.isConnected && insertAfterElement?.isConnected) {
+                // Insert tab after the reference element
+                const nextSibling = insertAfterElement.nextSibling;
+                if (nextSibling) {
+                  tabsContainer.insertBefore(tab, nextSibling);
+                } else {
+                  tabsContainer.appendChild(tab);
+                }
+                insertAfterElement = tab;
+              }
+            });
+            
+            console.log("[TabSort] Reorder - Complete!");
+          }
+        }
+      } catch (reorderError) {
+        console.error("Error reordering tabs (groups first):", reorderError);
+        // Don't fail the whole sort if reordering fails
+      }
     } catch (error) {
       console.error("Error during overall sorting process:", error);
     } finally {

@@ -194,7 +194,7 @@
 
 .separator-path-segment {
   /* Use light-dark() to adapt to theme like native toolbarseparator */
-  stroke: light-dark(rgba(0, 0, 0, 0.1), rgba(255, 255, 255, 0.1)) !important;
+  stroke: light-dark(rgba(0, 0, 0, 0.2), rgba(255, 255, 255, 0.2)) !important;
 }
 
 [lwt-toolbar="light"] {
@@ -208,7 +208,7 @@
 
   & .separator-path-segment {
     /* Match native toolbarseparator color for light theme */
-    stroke: rgba(0, 0, 0, 0.1) !important;
+    stroke: rgba(0, 0, 0, 0.2) !important;
   }
 }
 
