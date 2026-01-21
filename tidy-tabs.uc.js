@@ -1489,6 +1489,101 @@
     };
   }
 
+  // --- Patch Clear Button to Preserve Tab-Groups ---
+  function patchClearButtonToPreserveGroups() {
+    if (typeof window.gZenWorkspaces === "undefined") {
+      console.warn("[TidyTabs] gZenWorkspaces not available, cannot patch clear button");
+      return;
+    }
+
+    // Store the original method
+    const originalCloseAllUnpinnedTabs = window.gZenWorkspaces.closeAllUnpinnedTabs;
+    
+    if (typeof originalCloseAllUnpinnedTabs !== "function") {
+      console.warn("[TidyTabs] closeAllUnpinnedTabs method not found");
+      return;
+    }
+
+    // Override the method
+    window.gZenWorkspaces.closeAllUnpinnedTabs = function() {
+      console.log("[TidyTabs] Clear button clicked - filtering to preserve tab-groups");
+      
+      try {
+        // Get all tabs in the current workspace
+        const allTabs = this.allStoredTabs || [];
+        
+        // Filter tabs to close: exclude pinned, grouped, essential, and empty tabs
+        const tabsToClose = allTabs.filter(tab => {
+          // Safety check
+          if (!tab || !tab.isConnected) return false;
+          
+          // Don't close pinned tabs
+          if (tab.pinned) {
+            console.log("[TidyTabs] Preserving pinned tab:", getTabTitle(tab));
+            return false;
+          }
+          
+          // Don't close tabs that are in a group/folder
+          if (tab.group) {
+            // Check if it's a zen-folder
+            if (tab.group.isZenFolder || tab.group.tagName === "zen-folder") {
+              console.log("[TidyTabs] Preserving tab in folder:", getTabTitle(tab));
+              return false;
+            }
+            // Check if it's a regular tab-group (not split-view)
+            if (tab.group.tagName === "tab-group" && !tab.group.hasAttribute("split-view-group")) {
+              console.log("[TidyTabs] Preserving tab in group:", getTabTitle(tab));
+              return false;
+            }
+          }
+          
+          // Don't close essential tabs
+          if (tab.hasAttribute("zen-essential")) {
+            console.log("[TidyTabs] Preserving essential tab:", getTabTitle(tab));
+            return false;
+          }
+          
+          // Don't close empty tabs
+          if (tab.hasAttribute("zen-empty-tab")) {
+            return false;
+          }
+          
+          // Don't close glance tabs
+          if (tab.hasAttribute("zen-glance-tab")) {
+            return false;
+          }
+          
+          // This tab can be closed
+          return true;
+        });
+        
+        console.log(`[TidyTabs] Closing ${tabsToClose.length} tabs, preserving ${allTabs.length - tabsToClose.length} tabs`);
+        
+        // Close the filtered tabs
+        if (tabsToClose.length > 0) {
+          gBrowser.removeTabs(tabsToClose);
+          
+          // Show a toast notification
+          if (typeof gZenUIManager !== "undefined" && gZenUIManager.showToast) {
+            gZenUIManager.showToast("zen-workspaces-close-all-unpinned-tabs-toast", {
+              shortcut: "Ctrl+Shift+T"
+            });
+          }
+        } else {
+          console.log("[TidyTabs] No tabs to close");
+        }
+      } catch (error) {
+        console.error("[TidyTabs] Error in patched closeAllUnpinnedTabs:", error);
+        // Fallback to original method if there's an error
+        if (typeof originalCloseAllUnpinnedTabs === "function") {
+          originalCloseAllUnpinnedTabs.call(this);
+        }
+      }
+    };
+    
+    console.log("[TidyTabs] Successfully patched closeAllUnpinnedTabs to preserve tab-groups");
+  }
+
   // --- Optimized Helper: Count Tabs for Button Visibility ---
   const countTabsForButtonVisibility = () => {
     const currentWorkspaceId = window.gZenWorkspaces?.activeWorkspace;
@@ -1675,6 +1770,7 @@
           setupSortCommandAndListener();
           addSortButtonToAllSeparators();
           setupgZenWorkspacesHooks();
+          patchClearButtonToPreserveGroups(); // Patch the clear button
           updateButtonsVisibilityState();
           addTabEventListeners();
 
