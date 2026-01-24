@@ -7,7 +7,7 @@
 (() => {
   const CONFIG = {
     SIMILARITY_THRESHOLD: 0.45,
-    GROUP_SIMILARITY_THRESHOLD: 0.75,
+    GROUP_SIMILARITY_THRESHOLD: 0.65, // Lowered from 0.75 to be more inclusive for existing groups
     MIN_TABS_FOR_SORT: 6, // This is the ammount of tabs for the button to show, not the ammount of tabs you need in a group
     DEBOUNCE_DELAY: 250,
     ANIMATION_DURATION: 800,
@@ -15,6 +15,7 @@
     INIT_CHECK_INTERVAL: 100,
     CONSOLIDATION_DISTANCE_THRESHOLD: 2,
     EMBEDDING_BATCH_SIZE: 5,
+    EXISTING_GROUP_BOOST: 0.1, // Boost similarity score for existing groups to prefer them
   };
 
   // --- Globals & State ---
@@ -278,82 +279,21 @@
     return groups;
   }
 
-  // Batch storage operations for better performance
-  const batchStorageOperations = (operations) => {
+  // Batch DOM operations for better performance
+  const batchDOMUpdates = (operations) => {
     if (!Array.isArray(operations) || operations.length === 0) return;
 
+    // Use document fragment for batching when possible
+    const fragment = document.createDocumentFragment();
+
     try {
-      operations.forEach(({ type, key, value }) => {
-        if (type === "set" && key && value) {
-          UC_API.SharedStorage.set(key, value);
-        } else if (type === "get" && key) {
-          return UC_API.SharedStorage.get(key);
+      operations.forEach((operation) => {
+        if (typeof operation === "function") {
+          operation(fragment);
         }
       });
-    } catch (e) {
-      console.error("[TabSort][Storage] Batch operation failed:", e);
-    }
-  };
-
-  // SharedStorage helper functions with input validation
-  const getStoredGroups = () => {
-    try {
-      if (!UC_API?.SharedStorage?.getKeys) return {};
-
-      const keys = UC_API.SharedStorage.getKeys();
-      const groups = {};
-
-      keys.forEach((key) => {
-        if (typeof key === "string" && key.startsWith("GroupData_")) {
-          const groupData = UC_API.SharedStorage.get(key);
-          if (groupData && typeof groupData === "object") {
-            groups[key] = groupData;
-          }
-        }
-      });
-      return groups;
-    } catch (e) {
-      console.error("[TabSort][Storage] Error getting stored groups:", e);
-      return {};
-    }
-  };
-
-  const saveGroupData = (groupId, groupName, tabIds, averageEmbedding) => {
-    if (!groupId || !groupName || !Array.isArray(tabIds)) {
-      console.error("[TabSort][Storage] Invalid parameters for saveGroupData");
-      return;
-    }
-
-    try {
-      const groupData = {
-        groupName: String(groupName),
-        tabIds: [...tabIds],
-        embeddings: Array.isArray(averageEmbedding)
-          ? [...averageEmbedding]
-          : [],
-        lastUpdated: Date.now(),
-      };
-      UC_API.SharedStorage.set(`GroupData_${groupId}`, groupData);
-    } catch (e) {
-      console.error("[TabSort][Storage] Error saving group data:", e);
-    }
-  };
-
-  const updateGroupTabIds = (groupId, newTabIds) => {
-    if (!groupId || !Array.isArray(newTabIds)) return;
-
-    try {
-      const key = `GroupData_${groupId}`;
-      const groupData = UC_API.SharedStorage.get(key);
-      if (groupData && typeof groupData === "object") {
-        groupData.tabIds = [
-          ...new Set([...(groupData.tabIds || []), ...newTabIds]),
-        ];
-        groupData.lastUpdated = Date.now();
-        UC_API.SharedStorage.set(key, groupData);
-      }
-    } catch (e) {
-      console.error("[TabSort][Storage] Error updating group tab IDs:", e);
+    } catch (error) {
+      console.error("Error in batch DOM operations:", error);
     }
   };
 
@@ -425,19 +365,58 @@
     const validTabs = tabs.filter((tab) => tab?.isConnected);
     if (!validTabs.length) return [];
 
-    // Get stored groups
-    const storedGroups = getStoredGroups();
+    const currentWorkspaceId = window.gZenWorkspaces?.activeWorkspace;
     const result = [];
     const ungroupedTabs = [];
+
+    // Get existing groups in current workspace
+    const existingWorkspaceGroups = new Map();
+    if (currentWorkspaceId) {
+      const groupSelector = `tab-group:has(tab[zen-workspace-id="${currentWorkspaceId}"])`;
+      document.querySelectorAll(groupSelector).forEach((groupEl) => {
+        const label = groupEl.getAttribute("label");
+        if (label) {
+          // Get tabs in this group to calculate group embedding
+          const groupTabs = Array.from(groupEl.querySelectorAll('tab')).filter(tab => 
+            tab.getAttribute("zen-workspace-id") === currentWorkspaceId
+          );
+          if (groupTabs.length > 0) {
+            existingWorkspaceGroups.set(label, {
+              element: groupEl,
+              tabs: groupTabs,
+              tabTitles: groupTabs.map(tab => getTabTitle(tab))
+            });
+          }
+        }
+      });
+    }
 
     // Process tabs in batches for better performance
     const tabTitles = validTabs.map((tab) => getTabTitle(tab));
     const embeddings = await processTabsInBatches(validTabs);
 
-    // First pass: try to match tabs to existing groups
+    // Calculate embeddings for existing workspace groups
+    const existingGroupEmbeddings = new Map();
+    for (const [groupName, groupInfo] of existingWorkspaceGroups) {
+      try {
+        const groupTabEmbeddings = await processTabsInBatches(groupInfo.tabs);
+        const validGroupEmbeddings = groupTabEmbeddings.filter(emb => 
+          Array.isArray(emb) && emb.length > 0
+        );
+        if (validGroupEmbeddings.length > 0) {
+          const avgEmbedding = averageEmbedding(validGroupEmbeddings);
+          existingGroupEmbeddings.set(groupName, avgEmbedding);
+        }
+      } catch (e) {
+        console.error(`[TabSort] Error calculating embedding for existing group "${groupName}":`, e);
+      }
+    }
+
+    // Enhanced matching: try to match tabs to existing groups
     for (let i = 0; i < validTabs.length; i++) {
       const tab = validTabs[i];
       const tabEmbedding = embeddings[i];
+      const tabTitle = tabTitles[i];
 
       if (!tabEmbedding) {
         ungroupedTabs.push(tab);
@@ -447,37 +426,64 @@
       let bestMatch = null;
       let bestSimilarity = 0;
 
-      // Compare against stored groups
-      for (const [groupKey, groupData] of Object.entries(storedGroups)) {
-        if (!Array.isArray(groupData?.embeddings)) continue;
+      // Check against current workspace groups
+      for (const [groupName, groupInfo] of existingWorkspaceGroups) {
+        const groupEmbedding = existingGroupEmbeddings.get(groupName);
+        if (!groupEmbedding) continue;
 
-        const similarity = cosineSimilarity(tabEmbedding, groupData.embeddings);
-        if (
-          similarity > CONFIG.GROUP_SIMILARITY_THRESHOLD &&
-          similarity > bestSimilarity
-        ) {
-          bestMatch = { groupKey, groupData, similarity };
+        let similarity = cosineSimilarity(tabEmbedding, groupEmbedding);
+        similarity += CONFIG.EXISTING_GROUP_BOOST; // Always boost existing groups
+
+        if (similarity > CONFIG.GROUP_SIMILARITY_THRESHOLD && similarity > bestSimilarity) {
+          bestMatch = { 
+            groupData: { groupName }, 
+            similarity,
+            isExistingGroup: true
+          };
           bestSimilarity = similarity;
+        }
+      }
+
+      // Additional semantic matching for existing groups using title similarity
+      if (!bestMatch || bestMatch.similarity < 0.8) {
+        for (const [groupName, groupInfo] of existingWorkspaceGroups) {
+          // Check if tab title has semantic similarity to group tabs
+          const titleSimilarities = groupInfo.tabTitles.map(groupTabTitle => {
+            const distance = levenshteinDistance(tabTitle.toLowerCase(), groupTabTitle.toLowerCase());
+            const maxLen = Math.max(tabTitle.length, groupTabTitle.length);
+            return maxLen > 0 ? 1 - (distance / maxLen) : 0;
+          });
+
+          const maxTitleSimilarity = Math.max(...titleSimilarities);
+          
+          // If we find strong title similarity, consider it a match
+          if (maxTitleSimilarity > 0.7) {
+            const adjustedSimilarity = maxTitleSimilarity * 0.8 + CONFIG.EXISTING_GROUP_BOOST;
+            if (adjustedSimilarity > CONFIG.GROUP_SIMILARITY_THRESHOLD && adjustedSimilarity > bestSimilarity) {
+              bestMatch = { 
+                groupData: { groupName }, 
+                similarity: adjustedSimilarity,
+                isExistingGroup: true,
+                matchType: 'title'
+              };
+              bestSimilarity = adjustedSimilarity;
+            }
+          }
         }
       }
 
       if (bestMatch) {
         // Add tab to existing group
         result.push({ tab, topic: bestMatch.groupData.groupName });
-        // Update stored group with new tab ID
-        const tabId =
-          tab.getAttribute("zen-tab-id") ||
-          tab.linkedPanel ||
-          Math.random().toString(36);
-        updateGroupTabIds(bestMatch.groupKey.replace("GroupData_", ""), [
-          tabId,
-        ]);
+        console.log(`[TabSort] Matched "${tabTitle}" to existing group "${bestMatch.groupData.groupName}" (similarity: ${bestMatch.similarity.toFixed(3)}, type: ${bestMatch.matchType || 'embedding'})`);
       } else {
         ungroupedTabs.push(tab);
       }
     }
 
-    // Second pass: cluster remaining ungrouped tabs
+    console.log(`[TabSort] Matched ${result.length} tabs to existing groups, ${ungroupedTabs.length} tabs remain ungrouped`);
+
+    // Second pass: cluster remaining ungrouped tabs (only if we have enough)
     if (ungroupedTabs.length > 1) {
       const ungroupedEmbeddings = await processTabsInBatches(ungroupedTabs);
 
@@ -615,33 +621,46 @@
               (idx) => ungroupedTabs[validIndices[idx]]
             );
             const groupTitles = groupTabs.map((tab) => getTabTitle(tab));
-            const groupName = await nameGroupWithSmartTabTopic(groupTitles);
 
-            // Calculate average embedding for the group
-            const groupEmbeddings = group.map((idx) => validEmbeddings[idx]);
-            const avgEmbedding = averageEmbedding(groupEmbeddings);
+            // Check if this new group would be similar to an existing group
+            let shouldCreateNewGroup = true;
+            let targetExistingGroup = null;
 
-            // Generate unique group ID
-            const groupId = `${groupName.replace(
-              /\s+/g,
-              "_"
-            )}_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`;
+            if (groupTabs.length >= 2) {
+              const groupEmbeddings = group.map((idx) => validEmbeddings[idx]);
+              const avgEmbedding = averageEmbedding(groupEmbeddings);
 
-            // Get tab IDs
-            const tabIds = groupTabs.map(
-              (tab) =>
-                tab.getAttribute("zen-tab-id") ||
-                tab.linkedPanel ||
-                Math.random().toString(36)
-            );
+              // Check similarity to existing groups one more time with the averaged embedding
+              for (const [groupName, groupInfo] of existingWorkspaceGroups) {
+                const existingEmbedding = existingGroupEmbeddings.get(groupName);
+                if (existingEmbedding) {
+                  const similarity = cosineSimilarity(avgEmbedding, existingEmbedding) + CONFIG.EXISTING_GROUP_BOOST;
+                  if (similarity > CONFIG.GROUP_SIMILARITY_THRESHOLD * 0.9) { // Slightly lower threshold for group-to-group matching
+                    shouldCreateNewGroup = false;
+                    targetExistingGroup = groupName;
+                    console.log(`[TabSort] Merging new group into existing group "${groupName}" (similarity: ${similarity.toFixed(3)})`);
+                    break;
+                  }
+                }
+              }
+            }
 
-            // Save group data to SharedStorage
-            saveGroupData(groupId, groupName, tabIds, avgEmbedding);
+            if (!shouldCreateNewGroup && targetExistingGroup) {
+              // Add all tabs to the existing group
+              groupTabs.forEach((tab) => {
+                result.push({ tab, topic: targetExistingGroup });
+              });
+            } else {
+              // Create new group
+              const groupName = await nameGroupWithSmartTabTopic(groupTitles);
 
-            // Add to result
-            groupTabs.forEach((tab) => {
-              result.push({ tab, topic: groupName });
-            });
+              // Add to result
+              groupTabs.forEach((tab) => {
+                result.push({ tab, topic: groupName });
+              });
+
+              console.log(`[TabSort] Created new group "${groupName}" with ${groupTabs.length} tabs`);
+            }
           }
         }
       }
@@ -662,7 +681,8 @@
       sortAnimationId = null;
 
       try {
-        const activeSeparator = document.querySelector(
+        const activeWorkspace = gZenWorkspaces?.activeWorkspaceElement;
+        const activeSeparator = activeWorkspace?.querySelector(
           ".pinned-tabs-container-separator:not(.has-no-sortable-tabs)"
         );
         const pathElement = activeSeparator?.querySelector("#separator-path");
@@ -756,24 +776,6 @@
     } catch (error) {
       console.error("Error in failure animation:", error);
       isPlayingFailureAnimation = false;
-    }
-  };
-
-  // Batch DOM operations for better performance
-  const batchDOMUpdates = (operations) => {
-    if (!Array.isArray(operations) || operations.length === 0) return;
-
-    // Use document fragment for batching when possible
-    const fragment = document.createDocumentFragment();
-
-    try {
-      operations.forEach((operation) => {
-        if (typeof operation === "function") {
-          operation(fragment);
-        }
-      });
-    } catch (error) {
-      console.error("Error in batch DOM operations:", error);
     }
   };
 
@@ -932,13 +934,25 @@
 
       // --- End Consolidation ---
 
-      // Check if sorting failed (no groups created from sortable tabs)
-      // Count groups with more than 1 tab (single tab groups are not considered successful sorting)
+      // Check if sorting failed (no meaningful grouping occurred)
+      // Success criteria:
+      // 1. Created groups with multiple tabs, OR
+      // 2. Successfully matched tabs to existing groups (even single tabs)
       const multiTabGroups = Object.values(finalGroups).filter(
         (tabs) => tabs.length > 1
       );
-      const sortingFailed =
-        multiTabGroups.length === 0 && initialTabsToSort.length > 1;
+      
+      // Count tabs that were successfully matched to existing groups
+      const tabsMatchedToExistingGroups = aiTabTopics.length;
+      
+      // Sorting is successful if:
+      // - We created new multi-tab groups, OR
+      // - We matched tabs to existing groups, OR  
+      // - We only had 1 tab to sort (no failure for single tabs)
+      const sortingFailed = 
+        multiTabGroups.length === 0 && 
+        tabsMatchedToExistingGroups === 0 && 
+        initialTabsToSort.length > 1;
 
       console.log(
         "[TabSort] Debug - Initial tabs to sort:",
@@ -946,9 +960,14 @@
       );
       console.log("[TabSort] Debug - Final groups:", Object.keys(finalGroups));
       console.log("[TabSort] Debug - Multi-tab groups:", multiTabGroups.length);
+      console.log("[TabSort] Debug - Tabs matched to existing groups:", tabsMatchedToExistingGroups);
       console.log(
         "[TabSort] Debug - multiTabGroups.length === 0:",
         multiTabGroups.length === 0
+      );
+      console.log(
+        "[TabSort] Debug - tabsMatchedToExistingGroups === 0:",
+        tabsMatchedToExistingGroups === 0
       );
       console.log(
         "[TabSort] Debug - initialTabsToSort.length > 1:",
@@ -1650,12 +1669,25 @@
           // Handle Tidy button visibility
           const tidyButton = separator.querySelector("#sort-button");
           if (tidyButton) {
+            // Show button if:
+            // 1. We have existing groups and any ungrouped tabs (even just 1)
+            // 2. OR we have enough ungrouped tabs to potentially create new groups
             const shouldShowTidyButton = hasGroupedTabs
-              ? ungroupedTotal > 0
-              : ungroupedTotal >= CONFIG.MIN_TABS_FOR_SORT;
+              ? ungroupedTotal > 0  // Show if any ungrouped tabs exist when groups are present
+              : ungroupedTotal >= CONFIG.MIN_TABS_FOR_SORT; // Original logic for new group creation
 
             if (shouldShowTidyButton) {
               tidyButton.classList.remove("hidden-button");
+              // Update tooltip based on context
+              if (hasGroupedTabs && ungroupedTotal > 0) {
+                tidyButton.setAttribute("tooltiptext", 
+                  ungroupedTotal === 1 
+                    ? "Sort Tab into Existing Groups by Topic (AI)"
+                    : "Sort Tabs into Groups by Topic (AI)"
+                );
+              } else {
+                tidyButton.setAttribute("tooltiptext", "Sort Tabs into Groups by Topic (AI)");
+              }
             } else {
               tidyButton.classList.add("hidden-button");
             }
