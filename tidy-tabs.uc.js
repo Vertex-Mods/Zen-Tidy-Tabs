@@ -1359,8 +1359,14 @@
       try {
         zenCommands.addEventListener("command", (event) => {
           if (event.target.id === "cmd_zenSortTabs") {
-            // Add brushing animation class
-            const sortButton = document.querySelector("#sort-button");
+            // Find the separator in the ACTIVE workspace
+            const activeWorkspace = gZenWorkspaces?.activeWorkspaceElement;
+            const separator = activeWorkspace?.querySelector(
+              ".pinned-tabs-container-separator:not(.has-no-sortable-tabs)"
+            );
+
+            // Add brushing animation class to the sort button in the active workspace
+            const sortButton = separator?.querySelector("#sort-button");
             if (sortButton) {
               sortButton.classList.add("brushing");
               // Remove class after animation completes
@@ -1373,19 +1379,6 @@
 
             // Prevent starting animation if already running
             if (sortAnimationId !== null) return;
-
-            // Try finding the active separator directly
-            const separators = domCache.getSeparators();
-            let separator = null;
-            for (const sep of separators) {
-              if (
-                sep?.isConnected &&
-                !sep.classList.contains("has-no-sortable-tabs")
-              ) {
-                separator = sep;
-                break;
-              }
-            }
 
             if (!separator) {
               sortTabsByTopic(); // Still run sort even if animation fails
