@@ -684,7 +684,9 @@
     isPlayingFailureAnimation = true;
 
     try {
-      const activeSeparator = document.querySelector(
+      // Find the separator in the ACTIVE workspace, not the first one in DOM
+      const activeWorkspace = gZenWorkspaces?.activeWorkspaceElement;
+      const activeSeparator = activeWorkspace?.querySelector(
         ".pinned-tabs-container-separator:not(.has-no-sortable-tabs)"
       );
       const pathElement = activeSeparator?.querySelector("#separator-path");
