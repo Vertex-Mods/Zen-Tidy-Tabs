@@ -1504,8 +1504,18 @@
       console.log("[TidyTabs] Clear button clicked - filtering to preserve tab-groups");
       
       try {
-        // Get all tabs in the current workspace
-        const allTabs = this.allStoredTabs || [];
+        // Get the ACTIVE workspace ID - this is critical!
+        const currentWorkspaceId = this.activeWorkspace;
+        if (!currentWorkspaceId) {
+          console.warn("[TidyTabs] No active workspace found");
+          return;
+        }
+        
+        // Get all tabs and filter to ONLY the active workspace
+        const allTabs = Array.from(gBrowser.tabs).filter(tab => {
+          const tabWorkspaceId = tab.getAttribute("zen-workspace-id");
+          return tabWorkspaceId === currentWorkspaceId;
+        });
         
         // Filter tabs to close: exclude pinned, grouped, essential, and empty tabs
         const tabsToClose = allTabs.filter(tab => {
@@ -1514,7 +1524,6 @@
           
           // Don't close pinned tabs
           if (tab.pinned) {
-            console.log("[TidyTabs] Preserving pinned tab:", getTabTitle(tab));
             return false;
           }
           
@@ -1522,19 +1531,16 @@
           if (tab.group) {
             // Check if it's a zen-folder
             if (tab.group.isZenFolder || tab.group.tagName === "zen-folder") {
-              console.log("[TidyTabs] Preserving tab in folder:", getTabTitle(tab));
               return false;
             }
             // Check if it's a regular tab-group (not split-view)
             if (tab.group.tagName === "tab-group" && !tab.group.hasAttribute("split-view-group")) {
-              console.log("[TidyTabs] Preserving tab in group:", getTabTitle(tab));
               return false;
             }
           }
           
           // Don't close essential tabs
           if (tab.hasAttribute("zen-essential")) {
-            console.log("[TidyTabs] Preserving essential tab:", getTabTitle(tab));
             return false;
           }
           
