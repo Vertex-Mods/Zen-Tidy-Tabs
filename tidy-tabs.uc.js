@@ -1536,10 +1536,15 @@
           return tabWorkspaceId === currentWorkspaceId;
         });
         
-        // Filter tabs to close: exclude pinned, grouped, essential, and empty tabs
+        // Filter tabs to close: exclude pinned, grouped, essential, empty, and selected tabs
         const tabsToClose = allTabs.filter(tab => {
           // Safety check
           if (!tab || !tab.isConnected) return false;
+          
+          // Don't close the selected tab
+          if (tab.selected) {
+            return false;
+          }
           
           // Don't close pinned tabs
           if (tab.pinned) {
