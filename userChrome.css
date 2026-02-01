@@ -1,0 +1,219 @@
+@keyframes brush-sweep {
+  0% {
+    transform: rotate(0deg);
+  }
+
+  20% {
+    transform: rotate(-15deg);
+  }
+
+  40% {
+    transform: rotate(15deg);
+  }
+
+  60% {
+    transform: rotate(-15deg);
+  }
+
+  80% {
+    transform: rotate(15deg);
+  }
+
+  100% {
+    transform: rotate(0deg);
+  }
+}
+
+@keyframes loading-pulse-tab {
+  0%,
+  100% {
+    opacity: 0.6;
+  }
+
+  50% {
+    opacity: 1;
+  }
+}
+
+.pinned-tabs-container-separator {
+  /* Only override what's necessary, let native styles handle layout */
+  overflow: visible !important;
+
+  & svg {
+    width: 100% !important;
+    height: 1px;
+    min-height: 1px !important;
+    display: block;
+    overflow: visible;
+    transition: width 0.15s ease-in-out;
+    min-width: 0;
+    margin: auto 4px !important;
+    flex-grow: 1;
+  }
+
+  & #sort-button {
+    appearance: none !important;
+    opacity: 0;
+    visibility: collapse;
+    transition:
+      opacity 0.15s,
+      visibility 0.15s;
+    font-size: 10px !important;
+    font-weight: 500;
+    gap: 2px;
+    flex-shrink: 0;
+    min-width: 0;
+    overflow: hidden;
+    pointer-events: none;
+    margin: 0 !important;
+    padding: 0 !important;
+    white-space: nowrap;
+    /* Don't hardcode color - let it inherit from theme like native clear button */
+    /* Match native clear button context properties for icon color */
+    -moz-context-properties: fill, fill-opacity !important;
+    fill: currentColor !important;
+
+    & label {
+      display: block;
+      font-weight: 600;
+    }
+
+    & .toolbarbutton-text {
+      display: flex;
+    }
+
+    & .broom-icon {
+      width: 10px !important;
+      height: 10px !important;
+      transition: transform 0.15s ease-in-out;
+      transform: translateY(0px);
+      /* Use currentColor to match native clear button icon color */
+      fill: currentColor !important;
+    }
+
+    & .broom-icon path {
+      /* Use currentColor so it adapts to theme changes like native button */
+      fill: currentColor !important;
+    }
+
+    @starting-style {
+      & .broom-icon {
+        transform: translateY(-2px);
+      }
+    }
+
+    &:active:hover .broom-icon {
+      transform: translateY(2px);
+    }
+
+    &.brushing .broom-icon {
+      animation: brush-sweep 0.8s ease-in-out;
+      transform-origin: 50% 50%;
+    }
+
+    #navigator-toolbox[zen-has-implicit-hover="true"] & {
+      visibility: visible;
+      opacity: 0.5;
+    }
+
+    &:hover {
+      opacity: 1 !important;
+    }
+
+    :root:not([zen-sidebar-expanded="true"]) & {
+      display: none;
+    }
+
+    &.hidden-button {
+      display: none !important;
+      pointer-events: none !important;
+      opacity: 0 !important;
+      margin: 0 !important;
+      padding: 0 !important;
+    }
+  }
+
+  &:hover {
+    & #sort-button {
+      visibility: visible;
+      opacity: 0.5;
+      pointer-events: auto;
+      cursor: pointer !important;
+    }
+
+    & #sort-button:hover {
+      opacity: 1 !important;
+    }
+  }
+
+  &.has-no-sortable-tabs {
+    max-height: 0 !important;
+    margin: 0 auto !important;
+    padding: 0 !important;
+    border: none !important;
+    overflow: hidden !important;
+    gap: 0 !important;
+
+    & svg,
+    & #sort-button {
+      display: none !important;
+      width: 0 !important;
+      opacity: 0 !important;
+    }
+  }
+}
+
+#vertical-pinned-tabs-container
+  .zen-workspace-tabs-section[hide-separator]
+  .pinned-tabs-container-separator {
+  max-height: 0 !important;
+  margin: 0 auto !important;
+  padding: 0 !important;
+  border: none !important;
+  overflow: hidden !important;
+  gap: 0 !important;
+}
+
+.vertical-pinned-tabs-container-separator:hover svg {
+  width: calc(
+    100% -
+      (
+        100px *
+          (1 - var(--sort-button-hidden, 0))
+      )
+  ) !important;
+}
+
+.tab-is-sorting {
+  & .tab-icon-image,
+  & .tab-label {
+    animation: loading-pulse-tab 1.5s ease-in-out infinite;
+    will-change: opacity;
+  }
+}
+
+.separator-path-segment {
+  /* Use light-dark() to adapt to theme like native toolbarseparator */
+  stroke: light-dark(rgba(0, 0, 0, 0.2), rgba(255, 255, 255, 0.2)) !important;
+}
+
+[lwt-toolbar="light"] {
+  & #sort-button {
+    color: rgba(0, 0, 0, 0.6);
+
+    &:hover {
+      color: black;
+    }
+  }
+
+  & .separator-path-segment {
+    /* Match native toolbarseparator color for light theme */
+    stroke: rgba(0, 0, 0, 0.2) !important;
+  }
+}
+
+.pinned-tabs-container-separator {
+  & toolbarseparator {
+    display: none !important;
+  }
+}

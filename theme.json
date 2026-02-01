@@ -1,0 +1,36 @@
+{
+  "id": "zen-tidy-tabs",
+  "name": "Zen Tidy Tabs",
+  "description": "Sort your tabs using Firefox's local AI but make it look awesome!",
+  "scripts": {
+    "tidy-tabs.uc.js": {
+      "include": [
+        "chrome://browser/content/browser.xhtml"
+      ]
+    }
+  },
+  "homepage": "https://github.com/Vertex-Mods/Zen-Tidy-Tabs",
+  "style": {
+    "chrome": "userChrome.css"
+  },
+  "preferences": "preferences.json",
+  "readme": "https://raw.githubusercontent.com/Vertex-Mods/Zen-Tidy-Tabs/main/README.md",
+  "image": "https://raw.githubusercontent.com/Vertex-Mods/Zen-Tidy-Tabs/main/image.png",
+  "author": "Vertex",
+  "version": "1.1.0s",
+  "tags": [
+    "Vortex",
+    "Zen Browser",
+    "Vertical Tabs",
+    "Tab Groups",
+    "Tab Folders",
+    "Tab Sorting",
+    "AI",
+    "Local",
+    "12th"
+  ],
+  "createdAt": "2025-09-20",
+  "updatedAt": "2025-09-20 08:23",
+  "modules": ["Vertex-Mods/Advanced-Tab-Groups"],
+  "fork": ["zen"]
+}
