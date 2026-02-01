@@ -1030,7 +1030,7 @@
                 ? groupParent.matches(groupSelector)
                 : false;
               if (tab && tab.isConnected && !isInGroupInCorrectWorkspace) {
-                gBrowser.moveTabToGroup(tab, existingGroupElement);
+                gBrowser.moveTabToExistingGroup(tab, existingGroupElement);
               } else {
                 console.warn(
                   ` -> Tab "${
