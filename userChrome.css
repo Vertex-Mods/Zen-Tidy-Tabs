@@ -245,3 +245,56 @@
     stroke: rgba(0, 0, 0, 0.2) !important;
   }
 }
+
+/* Tidy Tabs toasts — mirrors zen-tidy-downloads (.zen-toast) +
+   workspace-notifications (.wn-toast) pattern:
+   hbox.zen-toast in #zen-toast-container, spring via
+   gZenUIManager.motion, auto-dismiss, pause on hover. */
+.tidy-tabs-toast {
+  /* Let Zen own placement/background/corners/shadow like
+     wn-toast does — only hug text and center in the vbox. */
+  align-items: center !important;
+  width: fit-content !important;
+  min-width: 0 !important;
+  max-width: calc(100vw - 32px) !important;
+  box-sizing: border-box !important;
+  margin-inline: auto !important;
+  flex-shrink: 0 !important;
+  padding: 10px 14px 10px 12px !important;
+  gap: 10px;
+  border-left: 3px solid transparent;
+  cursor: default;
+  outline: none;
+
+  &:focus-visible {
+    outline: 2px solid var(--zen-primary-color, #0060df);
+    outline-offset: -2px;
+  }
+
+  & .tidy-tabs-toast-content {
+    flex: 0 1 auto !important;
+    min-width: 0 !important;
+  }
+
+  & .tidy-tabs-toast-title {
+    font-weight: 700;
+    font-size: 13px;
+    line-height: 1.3;
+    white-space: nowrap !important;
+    overflow: hidden !important;
+    text-overflow: ellipsis !important;
+    max-width: calc(100vw - 64px) !important;
+  }
+
+  &.tidy-tabs-toast--success {
+    border-left-color: light-dark(#2e7d32, #7bd88f) !important;
+  }
+
+  &.tidy-tabs-toast--error {
+    border-left-color: light-dark(#c92a2a, #ff8787) !important;
+  }
+
+  &.tidy-tabs-toast--info {
+    border-left-color: light-dark(#1565c0, #74c0fc) !important;
+  }
+}

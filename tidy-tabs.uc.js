@@ -16,6 +16,12 @@
     CONSOLIDATION_DISTANCE_THRESHOLD: 2,
     EMBEDDING_BATCH_SIZE: 5,
     EXISTING_GROUP_BOOST: 0.1, // Boost similarity score for existing groups to prefer them
+    AUTO_ICON_DELAY_MS: 800, // Wait after sort finishes before assigning icons (lets UI settle)
+    AUTO_ICON_SIMILARITY_THRESHOLD: 0.3, // Min embedding similarity to accept an icon match
+    AUTO_ICON_MAX_CANDIDATES: 24, // Max Tabler candidates to embedding-rerank per group
+    ICON_EMBEDDING_CACHE_LIMIT: 300,
+    WARMUP_DELAY_MS: 20000, // Idle delay after init before pre-loading ML engines (lets startup fully settle)
+    WARMUP_ENABLED: true, // Pre-create engines at startup so first sort is fast
   };
 
   // --- Ensure Firefox's local ML engine is enabled ---
@@ -32,6 +38,8 @@
   }
 
   const MIN_TABS_PREF = "zen.tidy-tabs.min-tabs-for-sort";
+  const AUTO_ICONS_PREF = "zen.tidy-tabs.auto-icons";
+  const AUTO_ICON_KEYWORDS_PREF = "zen.tidy-tabs.auto-icons-keywords";
 
   // User-configurable minimum tab count for the sort button to appear.
   // The user can type any amount (including less than 6) in the mod settings.
@@ -61,6 +69,38 @@
       console.error("[TabSort] Error reading min-tabs pref, using fallback:", e);
     }
     return fallback;
+  };
+
+  // Auto-icons toggle. Defaults to true so existing installs get icons
+  // without opening settings; unlisted pref reads throw, hence try/catch.
+  const getAutoIconsEnabled = () => {
+    try {
+      if (typeof Services === "undefined" || !Services.prefs) return true;
+      try {
+        return Services.prefs.getBoolPref(AUTO_ICONS_PREF, true);
+      } catch (_e) {
+        return true;
+      }
+    } catch (e) {
+      console.error("[TabSort] Error reading auto-icons pref:", e);
+      return true;
+    }
+  };
+
+  // Keyword fast-path toggle. When false, only the local AI embedding
+  // match runs over the Tabler set. Defaults to false: AI is the default.
+  const getAutoIconKeywordsEnabled = () => {
+    try {
+      if (typeof Services === "undefined" || !Services.prefs) return false;
+      try {
+        return Services.prefs.getBoolPref(AUTO_ICON_KEYWORDS_PREF, false);
+      } catch (_e) {
+        return false;
+      }
+    } catch (e) {
+      console.error("[TabSort] Error reading auto-icon keywords pref:", e);
+      return false;
+    }
   };
 
   const BROOM_ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 28 28" class="broom-icon">
@@ -364,78 +404,335 @@
     }
   };
 
-  // Process embeddings in batches for better performance
+  // --- ML engine singletons + embedding cache (perf) ---
+  // createEngine() spins up the inference runtime; doing it per-tab made
+  // sorting 15+ tabs painfully slow. Reuse one engine per model instead.
+  let embeddingEnginePromise = null;
+  let namerEnginePromise = null;
+  const embeddingCache = new Map();
+  const EMBEDDING_CACHE_LIMIT = 500;
+
+  const getEmbeddingEngine = () => {
+    if (!embeddingEnginePromise) {
+      embeddingEnginePromise = (async () => {
+        const { createEngine } = ChromeUtils.importESModule(
+          "chrome://global/content/ml/EngineProcess.sys.mjs"
+        );
+        return createEngine({
+          taskName: "feature-extraction",
+          modelId: "Mozilla/smart-tab-embedding",
+          modelHub: "huggingface",
+          engineId: "embedding-engine",
+        });
+      })();
+      // Allow retry on next call if creation failed.
+      embeddingEnginePromise.catch(() => {
+        embeddingEnginePromise = null;
+      });
+    }
+    return embeddingEnginePromise;
+  };
+
+  const getNamerEngine = () => {
+    if (!namerEnginePromise) {
+      namerEnginePromise = (async () => {
+        const { createEngine } = ChromeUtils.importESModule(
+          "chrome://global/content/ml/EngineProcess.sys.mjs"
+        );
+        return createEngine({
+          taskName: "text2text-generation",
+          modelId: "Mozilla/smart-tab-topic",
+          modelHub: "huggingface",
+          engineId: "group-namer",
+        });
+      })();
+      namerEnginePromise.catch(() => {
+        namerEnginePromise = null;
+      });
+    }
+    return namerEnginePromise;
+  };
+
+  // --- Startup warmup: pre-load ML engines idle so first sort is fast ---
+  // createEngine() + first engine.run() pays model download + ONNX init
+  // (~seconds on first sort). Do it once in the background after startup,
+  // never blocking sort and never showing toasts.
+  let warmupStarted = false;
+  let warmupTimer = null;
+  let warmupCancelled = false;
+
+  const cancelWarmup = () => {
+    warmupCancelled = true;
+    if (warmupTimer != null) {
+      try {
+        if (typeof window.cancelIdleCallback === "function") {
+          try {
+            window.cancelIdleCallback(warmupTimer);
+          } catch (_e) {}
+        }
+        clearTimeout(warmupTimer);
+      } catch (_e) {}
+      warmupTimer = null;
+    }
+  };
+
+  const warmupMLEngines = () => {
+    if (!CONFIG.WARMUP_ENABLED || warmupStarted) return;
+    warmupStarted = true;
+    warmupCancelled = false;
+
+    const kick = () => {
+      warmupTimer = null;
+      if (warmupCancelled || document.hidden) {
+        // Retry shortly when hidden — headless preload still helps,
+        // but don't fight tab-restore for CPU.
+        if (!warmupCancelled) {
+          try {
+            warmupTimer = setTimeout(kick, CONFIG.WARMUP_DELAY_MS);
+          } catch (_e) {}
+        }
+        return;
+      }
+      (async () => {
+        try {
+          await getEmbeddingEngine();
+          if (warmupCancelled) return;
+          // Tiny inference forces model download + session init now,
+          // so the first real sort only pays embedding time.
+          try {
+            await embedTexts(["warmup"]);
+          } catch (_e) {
+            /* engine promise reset already handled; sort will retry */
+          }
+          if (warmupCancelled) return;
+          // Pre-create topic engine too (no generation run — saves CPU
+          // until a new group actually needs naming).
+          try {
+            await getNamerEngine();
+          } catch (_e) {}
+        } catch (e) {
+          console.warn(
+            "[TidyTabs] ML warmup failed (will retry on first sort):",
+            e
+          );
+        }
+      })();
+    };
+
+    try {
+      if (typeof window.requestIdleCallback === "function") {
+        warmupTimer = window.requestIdleCallback(kick, {
+          timeout: CONFIG.WARMUP_DELAY_MS + 5000,
+        });
+      } else {
+        warmupTimer = setTimeout(kick, CONFIG.WARMUP_DELAY_MS);
+      }
+    } catch (_e) {
+      try {
+        warmupTimer = setTimeout(kick, CONFIG.WARMUP_DELAY_MS);
+      } catch (_e2) {}
+    }
+  };
+
+  const normalizeEmbedding = (vec) => {
+    if (!Array.isArray(vec) || vec.length === 0) return null;
+    if (typeof vec[0] !== "number") return null;
+    const norm = Math.sqrt(vec.reduce((sum, v) => sum + v * v, 0));
+    if (!Number.isFinite(norm) || norm === 0) return vec;
+    // Engine already normalizes; re-normalizing is idempotent and cheap.
+    if (Math.abs(norm - 1) < 1e-6) return vec;
+    return vec.map((v) => v / norm);
+  };
+
+  const parseSingleEmbedding = (item) => {
+    if (!item) return null;
+    if (item?.embedding && Array.isArray(item.embedding)) {
+      return item.embedding;
+    }
+    if (Array.isArray(item) && typeof item[0] === "number") {
+      return item;
+    }
+    if (Array.isArray(item) && Array.isArray(item[0])) {
+      return item[0];
+    }
+    if (item?.data) {
+      try {
+        return Array.from(item.data);
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  };
+
+  const parseEmbeddingBatch = (result, count) => {
+    if (!result) return new Array(count).fill(null);
+    // Batched result: one entry per input text.
+    if (Array.isArray(result) && result.length === count) {
+      return result.map((item) =>
+        normalizeEmbedding(averageEmbedding(parseSingleEmbedding(item)))
+      );
+    }
+    // Tensor with dims, e.g. { data: Float32Array, dims: [n, dim] }.
+    if (result?.data && Array.isArray(result?.dims)) {
+      try {
+        const flat = Array.from(result.data);
+        const [n, dim] = result.dims;
+        if (result.dims.length === 2 && n === count && dim > 0) {
+          return Array.from({ length: n }, (_, i) =>
+            normalizeEmbedding(flat.slice(i * dim, (i + 1) * dim))
+          );
+        }
+        if (result.dims.length === 1 && count === 1) {
+          return [normalizeEmbedding(flat)];
+        }
+      } catch {
+        /* fall through */
+      }
+    }
+    // Single-result shapes (back-compat with old per-title path).
+    if (count === 1) {
+      const single = Array.isArray(result)
+        ? parseSingleEmbedding(result[0] ?? result)
+        : parseSingleEmbedding(result);
+      return [normalizeEmbedding(averageEmbedding(single))];
+    }
+    return new Array(count).fill(null);
+  };
+
+  // Run true batched inference: one engine.run() for N titles.
+  // A dead inference port ("Port does not exist") must drop the singleton
+  // so the next call recreates the engine instead of reusing a dead one.
+  const embedTexts = async (titles, _retried = false) => {
+    if (!Array.isArray(titles) || titles.length === 0) return [];
+    let engine = null;
+    try {
+      engine = await getEmbeddingEngine();
+    } catch (e) {
+      console.error("[TabSort][AI] Error getting embedding engine:", e);
+      embeddingEnginePromise = null;
+      return new Array(titles.length).fill(null);
+    }
+    // Mirror Firefox's own SmartTabGrouping call: pass the texts as a batch
+    // and request mean pooling + normalization. Without "pooling: mean" the
+    // engine returns the raw per-token tensor instead of a single sentence
+    // vector, which this parser can't use (it would silently yield null and
+    // the sort would always "fail" with just an animation).
+    try {
+      const result = await engine.run({
+        args: [titles],
+        options: { pooling: "mean", normalize: true },
+      });
+      const parsed = parseEmbeddingBatch(result, titles.length);
+      // If the engine ignored batching and returned a single vector,
+      // fall back to per-title runs on the SAME engine (no re-creation).
+      if (
+        titles.length > 1 &&
+        parsed.every((v) => v === null) &&
+        Array.isArray(result) &&
+        typeof result[0] === "number"
+      ) {
+        const out = [];
+        for (const t of titles) {
+          try {
+            const r = await engine.run({
+              args: [[t]],
+              options: { pooling: "mean", normalize: true },
+            });
+            out.push(parseEmbeddingBatch(r, 1)[0] ?? null);
+          } catch {
+            out.push(null);
+          }
+        }
+        return out;
+      }
+      return parsed;
+    } catch (e) {
+      console.error("[TabSort][AI] Error in batched embedding:", e);
+      // Dead port / crashed inference process: drop the singleton so the
+      // next call creates a fresh engine. Retry once for transient kills.
+      embeddingEnginePromise = null;
+      const msg = String(e?.message ?? e ?? "");
+      if (!_retried && /port does not exist|port closed|message port/i.test(msg)) {
+        console.log("[TabSort][AI] Retrying embedding with a fresh engine...");
+        try {
+          return await embedTexts(titles, true);
+        } catch (retryErr) {
+          console.error("[TabSort][AI] Embedding retry failed:", retryErr);
+        }
+      }
+      return new Array(titles.length).fill(null);
+    }
+  };
+
+  const cacheKeyForTitle = (title) =>
+    typeof title === "string" ? title.trim().slice(0, 256) : "";
+
+  const getEmbeddingsForTitles = async (
+    titles,
+    batchSize = CONFIG.EMBEDDING_BATCH_SIZE
+  ) => {
+    if (!Array.isArray(titles) || titles.length === 0) return [];
+    const out = new Array(titles.length).fill(null);
+    const uncachedIndices = [];
+    const uncachedTitles = [];
+    for (let i = 0; i < titles.length; i++) {
+      const key = cacheKeyForTitle(titles[i]);
+      if (key && embeddingCache.has(key)) {
+        const cached = embeddingCache.get(key);
+        // Self-heal: entries cached as null during a crashed-engine sort
+        // must be treated as misses so the next sort retries inference.
+        if (Array.isArray(cached) && cached.length > 0) {
+          out[i] = cached;
+        } else {
+          embeddingCache.delete(key);
+          uncachedIndices.push(i);
+          uncachedTitles.push(titles[i]);
+        }
+      } else {
+        uncachedIndices.push(i);
+        uncachedTitles.push(titles[i]);
+      }
+    }
+    for (let i = 0; i < uncachedTitles.length; i += batchSize) {
+      const batchTitles = uncachedTitles.slice(i, i + batchSize);
+      const batchIdx = uncachedIndices.slice(i, i + batchSize);
+      const batchResults = await embedTexts(batchTitles);
+      batchResults.forEach((vec, j) => {
+        const globalIdx = batchIdx[j];
+        out[globalIdx] = vec;
+        // Never cache failures — a null vector would poison every future
+        // sort until restart (this is what made 3 sorts in a row fail).
+        if (!vec) return;
+        const key = cacheKeyForTitle(titles[globalIdx]);
+        if (key) {
+          if (embeddingCache.size >= EMBEDDING_CACHE_LIMIT) {
+            const oldest = embeddingCache.keys().next().value;
+            embeddingCache.delete(oldest);
+          }
+          embeddingCache.set(key, vec);
+        }
+      });
+    }
+    return out;
+  };
+
+  // Process embeddings in batches for better performance.
+  // Thin wrapper over the cached batched path (kept for back-compat).
   const processTabsInBatches = async (
     tabs,
     batchSize = CONFIG.EMBEDDING_BATCH_SIZE
   ) => {
     if (!Array.isArray(tabs) || tabs.length === 0) return [];
-
-    const results = [];
-    for (let i = 0; i < tabs.length; i += batchSize) {
-      const batch = tabs.slice(i, i + batchSize);
-      const batchResults = await Promise.all(
-        batch.map((tab) => generateEmbedding(getTabTitle(tab)))
-      );
-      results.push(...batchResults);
-    }
-    return results;
+    const titles = tabs.map((tab) => getTabTitle(tab));
+    return getEmbeddingsForTitles(titles, batchSize);
   };
 
   const generateEmbedding = async (title) => {
     if (!title || typeof title !== "string") return null;
-
     try {
-      const { createEngine } = ChromeUtils.importESModule(
-        "chrome://global/content/ml/EngineProcess.sys.mjs"
-      );
-      const engine = await createEngine({
-        taskName: "feature-extraction",
-        modelId: "Mozilla/smart-tab-embedding",
-        modelHub: "huggingface",
-        engineId: "embedding-engine",
-      });
-
-      // Mirror Firefox's own SmartTabGrouping call: pass the texts as a batch
-      // and request mean pooling + normalization. Without "pooling: mean" the
-      // engine returns the raw per-token tensor instead of a single sentence
-      // vector, which this parser can't use (it would silently yield null and
-      // the sort would always "fail" with just an animation).
-      const result = await engine.run({
-        args: [[title]],
-        options: { pooling: "mean", normalize: true },
-      });
-
-      // The engine returns an array whose first element is the pooled,
-      // normalized sentence vector (extra keys like "metrics" sit alongside it).
-      let embedding;
-
-      if (result?.[0]?.embedding && Array.isArray(result[0].embedding)) {
-        embedding = result[0].embedding;
-      } else if (result?.[0] && Array.isArray(result[0])) {
-        // Batched result: an array with one vector per input text.
-        embedding = result[0];
-      } else if (Array.isArray(result) && typeof result[0] === "number") {
-        // Engine squeezed the batch dimension and returned a flat vector.
-        embedding = result;
-      } else if (result?.data) {
-        // Raw Tensor object ({ data, dims }) — flatten its data buffer.
-        embedding = Array.from(result.data);
-      } else {
-        return null;
-      }
-
-      const pooled = averageEmbedding(embedding);
-      if (
-        Array.isArray(pooled) &&
-        pooled.length > 0 &&
-        typeof pooled[0] === "number"
-      ) {
-        // Normalize the embedding
-        const norm = Math.sqrt(pooled.reduce((sum, v) => sum + v * v, 0));
-        return norm === 0 ? pooled : pooled.map((v) => v / norm);
-      }
-      return null;
+      const [vec] = await getEmbeddingsForTitles([title], 1);
+      return vec ?? null;
     } catch (e) {
       console.error("[TabSort][AI] Error generating embedding:", e);
       return null;
@@ -451,6 +748,8 @@
     const currentWorkspaceId = window.gZenWorkspaces?.activeWorkspace;
     const result = [];
     const ungroupedTabs = [];
+    // Reuse first-pass vectors for the clustering pass below — no re-inference.
+    const ungroupedEmbeddingsReuse = [];
 
     // Get existing groups in current workspace
     const existingWorkspaceGroups = new Map();
@@ -474,15 +773,18 @@
       });
     }
 
-    // Process tabs in batches for better performance
+    // Batched inference with cache (single shared engine, no re-creation).
     const tabTitles = validTabs.map((tab) => getTabTitle(tab));
-    const embeddings = await processTabsInBatches(validTabs);
+    const embeddings = await getEmbeddingsForTitles(tabTitles);
 
-    // Calculate embeddings for existing workspace groups
+    // Calculate embeddings for existing workspace groups (cache-hit when
+    // titles overlap with open tabs).
     const existingGroupEmbeddings = new Map();
     for (const [groupName, groupInfo] of existingWorkspaceGroups) {
       try {
-        const groupTabEmbeddings = await processTabsInBatches(groupInfo.tabs);
+        const groupTabEmbeddings = await getEmbeddingsForTitles(
+          groupInfo.tabTitles
+        );
         const validGroupEmbeddings = groupTabEmbeddings.filter(emb => 
           Array.isArray(emb) && emb.length > 0
         );
@@ -503,6 +805,7 @@
 
       if (!tabEmbedding) {
         ungroupedTabs.push(tab);
+        ungroupedEmbeddingsReuse.push(null);
         continue;
       }
 
@@ -561,14 +864,16 @@
         console.log(`[TabSort] Matched "${tabTitle}" to existing group "${bestMatch.groupData.groupName}" (similarity: ${bestMatch.similarity.toFixed(3)}, type: ${bestMatch.matchType || 'embedding'})`);
       } else {
         ungroupedTabs.push(tab);
+        ungroupedEmbeddingsReuse.push(tabEmbedding);
       }
     }
 
     console.log(`[TabSort] Matched ${result.length} tabs to existing groups, ${ungroupedTabs.length} tabs remain ungrouped`);
 
     // Second pass: cluster remaining ungrouped tabs (only if we have enough)
+    // Reuses first-pass vectors — no second inference run.
     if (ungroupedTabs.length > 1) {
-      const ungroupedEmbeddings = await processTabsInBatches(ungroupedTabs);
+      const ungroupedEmbeddings = ungroupedEmbeddingsReuse;
 
       // Filter out empty embeddings
       const validEmbeddings = ungroupedEmbeddings.filter(
@@ -653,7 +958,7 @@
             return keywords;
           }
 
-          // Group naming function
+          // Group naming function (shared singleton engine)
           async function nameGroupWithSmartTabTopic(titles) {
             const keywords = extractKeywords(titles);
             const input = `Topic from keywords: ${keywords.join(
@@ -661,15 +966,7 @@
             )}. titles:\n${titles.join("\n")}`;
 
             try {
-              const { createEngine } = ChromeUtils.importESModule(
-                "chrome://global/content/ml/EngineProcess.sys.mjs"
-              );
-              let engine = await createEngine({
-                taskName: "text2text-generation",
-                modelId: "Mozilla/smart-tab-topic",
-                modelHub: "huggingface",
-                engineId: "group-namer",
-              });
+              const engine = await getNamerEngine();
 
               const aiResult = await engine.run({
                 args: [input],
@@ -750,6 +1047,367 @@
     }
 
     return result;
+  };
+
+  // --- Auto group icons (background pass, never blocks sort) ---
+  // Reuses the already-warmed Mozilla/smart-tab-embedding engine + ATG's
+  // own icon inventory (Tabler via globalThis.advancedTabGroups) and its
+  // persistGroupIcon renderer, so icons look exactly like manual picks.
+  // Scheduled with setTimeout AFTER sort finishes; fire-and-forget.
+  const iconEmbeddingCache = new Map();
+
+  // Curated keyword -> Tabler icon name map. Instant path, no ML needed.
+  // Names must exist in ATG's icons/tabler-names.js (Tabler 3.48).
+  // NOTE: keep keywords specific — bare "auto" matched "automation" and
+  // sent "Ai Automation" to the car icon, so it was removed.
+  const ICON_KEYWORD_MAP = [
+    [["automation", "automate", "workflow", "n8n", "zapier", "ifttt", "make.com"], "automation"],
+    [["artificial intelligence", "llm", "chatgpt", "Muse", "gemini", "openai", "midjourney", "copilot"], "sparkles"],
+    [["github", "gitlab", "code", "coding", "programming", "developer", "stackoverflow"], "brand-github"],
+    [["python", "javascript", "typescript", "rust", "java "], "code"],
+    [["shopping", "amazon", "ebay", "store", "buy", "cart", "deal"], "shopping-cart"],
+    [["news", "article", "blog", "medium", "press"], "news"],
+    [["mail", "gmail", "outlook", "email", "inbox"], "mail"],
+    [["doc", "docs", "notion", "wiki", "confluence", "drive", "pdf"], "file-text"],
+    [["video", "stream", "twitch", "netflix", "movie", "film"], "video"],
+    [["youtube"], "brand-youtube"],
+    [["music", "spotify", "soundcloud", "bandcamp", "audio"], "music"],
+    [["social", "twitter", "x.com", "reddit", "facebook", "instagram", "tiktok", "discord"], "message"],
+    [["work", "job", "career", "linkedin", "meeting", "slack", "teams", "jira"], "briefcase"],
+    [["book", "read", "novel", "kindle", "library"], "book"],
+    [["school", "learn", "course", "tutorial", "udemy", "coursera", "study", "university"], "school"],
+    [["science", "research", "paper", "arxiv", "lab"], "flask"],
+    [["health", "fitness", "medical", "doctor", "gym"], "heart"],
+    [["sport", "football", "soccer", "basketball", "espn"], "trophy"],
+    [["game", "gaming", "steam", "xbox", "playstation", "nintendo"], "device-gamepad-2"],
+    [["travel", "flight", "hotel", "airbnb", "map", "trip"], "map"],
+    [["photo", "camera", "unsplash", "pinterest", "design", "figma", "dribbble"], "palette"],
+    [["finance", "bank", "money", "stock", "crypto", "invest"], "wallet"],
+    [["weather"], "cloud"],
+    [["food", "recipe", "cook", "restaurant"], "tools-kitchen-2"],
+    [["home", "house", "real estate", "zillow"], "home"],
+    [["car", "vehicle", "dealership", "motors"], "car"],
+  ];
+
+  // Synonym expansion for the AI path's text search. "ai" alone matches
+  // hundreds of icons as a substring (air, brain, said...), so expand it to
+  // concepts that actually retrieve the right candidates.
+  const ICON_SYNONYMS = {
+    ai: ["robot", "automation", "sparkles", "brain"],
+    llm: ["robot", "sparkles", "brain"],
+    automation: ["robot", "workflow", "cpu", "automation"],
+    automate: ["robot", "automation"],
+    n8n: ["automation", "workflow"],
+    zapier: ["automation", "workflow"],
+  };
+
+  const getAtg = () => {
+    try {
+      return globalThis.advancedTabGroups ?? null;
+    } catch (_e) {
+      return null;
+    }
+  };
+
+  const groupHasIcon = (group, atg) => {
+    try {
+      if (!group?.isConnected) return true; // treat dead nodes as "skip"
+      if (group.querySelector(".tab-group-icon image, .tab-group-icon label")) return true;
+      try {
+        if (atg?.savedIcons?.[group.id]) return true;
+      } catch (_e) {}
+      return false;
+    } catch (_e) {
+      return true;
+    }
+  };
+
+  // Filled-first URL: use the filled variant when the icon has one,
+  // otherwise fall back to outline (most icons, e.g. automation/robot, are
+  // outline-only). Accepts either an icon object or a bare name + lookup.
+  const pickTablerIconUrl = (iconOrName, lookup) => {
+    let icon = null;
+    if (iconOrName && typeof iconOrName === "object" && iconOrName.name) {
+      icon = iconOrName;
+    } else {
+      const name = String(iconOrName || "").trim();
+      if (!name) return null;
+      try {
+        icon = lookup?.get(name) ?? null;
+      } catch (_e) {
+        icon = null;
+      }
+      if (!icon) {
+        // Unknown to the index (shouldn't happen): assume outline exists.
+        return `resource://atg-tabler/outline/${name.replace(/[^a-z0-9-]/gi, "")}.svg`;
+      }
+    }
+    const safe = String(icon.name || "").trim().replace(/[^a-z0-9-]/gi, "");
+    if (!safe) return null;
+    const dir = icon.filled ? "filled" : "outline";
+    return {
+      url: `resource://atg-tabler/${dir}/${safe}.svg`,
+      name: icon.name,
+      variant: dir,
+    };
+  };
+
+  // Group-name-only matching: tab titles are deliberately ignored so a
+  // generic name like "Sports" isn't dragged toward a specific tab topic.
+  const findIconByKeywords = (topic) => {
+    const haystack = String(topic || "").toLowerCase();
+    if (!haystack.trim()) return null;
+    for (const [keywords, iconName] of ICON_KEYWORD_MAP) {
+      for (const kw of keywords) {
+        if (kw && haystack.includes(kw)) return iconName;
+      }
+    }
+    return null;
+  };
+
+  const cacheIconEmbedding = (key, vec) => {
+    if (!key) return;
+    if (iconEmbeddingCache.size >= CONFIG.ICON_EMBEDDING_CACHE_LIMIT) {
+      const oldest = iconEmbeddingCache.keys().next().value;
+      iconEmbeddingCache.delete(oldest);
+    }
+    iconEmbeddingCache.set(key, vec);
+  };
+
+  // Inline icon pass (awaited by the sort): assign ATG icons to groups
+  // that don't have one yet. Never throws outward; each group is independent.
+  const assignGroupIconsBackground = async (groupsMeta) => {
+    if (!Array.isArray(groupsMeta) || groupsMeta.length === 0) {
+      console.log("[TabSort] Auto-icons: nothing to do (no groups).");
+      return;
+    }
+    if (!getAutoIconsEnabled()) {
+      console.log("[TabSort] Auto-icons: disabled by pref, skipping.");
+      return;
+    }
+    const atg = getAtg();
+    if (!atg || typeof atg.persistGroupIcon !== "function") {
+      console.log("[TabSort] Auto-icons: Advanced Tab Groups not found, skipping.");
+      return;
+    }
+    console.log(
+      `[TabSort] Auto-icons: icon pass started for ${groupsMeta.length} group(s) (keywords ${getAutoIconKeywordsEnabled() ? "ON" : "OFF"})`
+    );
+
+    try {
+      // Ensure the Tabler resource:// pack is mounted (no-op if ready).
+      try {
+        await atg.setupAtgTablerPack?.();
+      } catch (_e) {}
+    } catch (_e) {}
+
+    // Filled variants are preferred at render time per-icon (see
+    // pickTablerIconUrl) — no style filtering here, since most icons
+    // (automation, robot, pool...) are outline-only.
+    for (const meta of groupsMeta) {
+      try {
+        const group = meta?.element;
+        if (!group || !group.isConnected) {
+          console.log("[TabSort] Auto-icons: skipping a group (element gone)");
+          continue;
+        }
+        if (groupHasIcon(group, atg)) {
+          console.log(
+            `[TabSort] Auto-icons: "${meta?.topic || group.getAttribute("label")}" already has an icon, skipping`
+          );
+          continue;
+        }
+
+        const topic = String(meta.topic || group.getAttribute("label") || "").trim();
+        const titles = Array.isArray(meta.titles) ? meta.titles : [];
+        if (!topic && titles.length === 0) continue;
+
+        // Full Tabler index (both variants — filled preferred at render).
+        let allIcons = [];
+        try {
+          allIcons =
+            typeof atg.atgTablerIcons === "function" ? atg.atgTablerIcons() : [];
+        } catch (_e) {
+          allIcons = [];
+        }
+        const byName = new Map((allIcons || []).map((ic) => [ic.name, ic]));
+
+        // Tier 1: instant keyword match on the group name only, zero ML cost.
+        // Skipped entirely when the keywords toggle is off (AI-only mode,
+        // now the default).
+        let picked = null;
+        let pickedVia = "";
+        if (getAutoIconKeywordsEnabled()) {
+          const kwName = findIconByKeywords(topic);
+          if (kwName && byName.get(kwName)) {
+            picked = byName.get(kwName);
+            pickedVia = "keyword";
+          }
+        }
+
+        // Exact shortcut: topic word equals an icon name ("automation" in
+        // "Ai Automation"). AND-search excludes the exact icon here, so
+        // check directly before any fuzzy logic.
+        if (!picked) {
+          try {
+            const topicWords = String(topic || "")
+              .toLowerCase()
+              .split(/[^a-z0-9]+/)
+              .filter((w) => w.length > 2);
+            for (const w of topicWords) {
+              const hit = byName.get(w);
+              if (hit && (hit.filled || hit.outline)) {
+                picked = hit;
+                pickedVia = "exact";
+                console.log(`[TabSort] Auto-icons: "${topic}" -> ${hit.name} (exact topic word)`);
+                break;
+              }
+            }
+          } catch (_e) {}
+        }
+
+        // Tier 2: local AI embedding re-rank over text-search candidates.
+        // NOTE: atgTablerSearch uses AND logic, so multi-word queries miss.
+        // Use per-word OR merge with synonym expansion instead.
+        if (!picked) {
+          console.log(`[TabSort] Auto-icons: AI match for "${topic}" (no keyword hit)`);
+          try {
+            const styled = (allIcons || []).filter((ic) => ic.filled || ic.outline);
+            let candidates = [];
+            if (typeof atg.atgTablerSearch === "function" && styled.length > 0) {
+              // Group name only — titles intentionally excluded.
+              const baseWords = String(topic || "")
+                .toLowerCase()
+                .split(/[^a-z0-9]+/)
+                .filter((w) => w.length > 2)
+                .slice(0, 8);
+              // Expand "ai" -> robot/automation/etc. so the right icons
+              // enter the candidate pool even when the literal word misses.
+              const expanded = [];
+              const seenW = new Set();
+              for (const w of baseWords) {
+                if (!seenW.has(w)) {
+                  seenW.add(w);
+                  expanded.push(w);
+                }
+                for (const syn of ICON_SYNONYMS[w] || []) {
+                  if (!seenW.has(syn)) {
+                    seenW.add(syn);
+                    expanded.push(syn);
+                  }
+                  if (expanded.length >= 14) break;
+                }
+                if (expanded.length >= 14) break;
+              }
+              const seen = new Set();
+              for (const w of expanded) {
+                try {
+                  for (const hit of atg.atgTablerSearch(styled, w).slice(0, 6)) {
+                    if (!seen.has(hit.name)) {
+                      seen.add(hit.name);
+                      candidates.push(hit);
+                    }
+                    if (candidates.length >= CONFIG.AUTO_ICON_MAX_CANDIDATES) break;
+                  }
+                } catch (_e) {}
+                if (candidates.length >= CONFIG.AUTO_ICON_MAX_CANDIDATES) break;
+              }
+            }
+            if (candidates.length === 0 && styled.length > 0) {
+              // Final safety net: the diverse curated set, not the first N
+              // alphabetically (which would be a-b, abacus, ... every time).
+              const wanted = new Set(ICON_KEYWORD_MAP.map(([, name]) => name));
+              candidates = styled.filter((ic) => wanted.has(ic.name));
+              if (candidates.length === 0) {
+                candidates = styled.slice(0, CONFIG.AUTO_ICON_MAX_CANDIDATES);
+              }
+              console.log(
+                `[TabSort] Auto-icons: text search found nothing for "${topic}", embedding ${candidates.length} curated icons instead`
+              );
+            } else {
+              console.log(
+                `[TabSort] Auto-icons: ${candidates.length} text candidate(s) for "${topic}"`
+              );
+            }
+            if (candidates.length > 0) {
+              // Embed the group name only — no tab titles.
+              const groupText = String(topic || "").slice(0, 256);
+              const [groupVec] = await getEmbeddingsForTitles([groupText], 1);
+              if (groupVec) {
+                const descs = candidates.map((c) =>
+                  `${c.name.replace(/-/g, " ")} ${c.words || ""}`.slice(0, 256)
+                );
+                const uncachedIdx = [];
+                const uncachedDescs = [];
+                const iconVecs = new Array(descs.length).fill(null);
+                descs.forEach((d, i) => {
+                  const key = `icon:${candidates[i].name}`;
+                  if (iconEmbeddingCache.has(key)) iconVecs[i] = iconEmbeddingCache.get(key);
+                  else {
+                    uncachedIdx.push(i);
+                    uncachedDescs.push(d);
+                  }
+                });
+                if (uncachedDescs.length > 0) {
+                  const fresh = await getEmbeddingsForTitles(
+                    uncachedDescs,
+                    CONFIG.EMBEDDING_BATCH_SIZE
+                  );
+                  fresh.forEach((v, j) => {
+                    iconVecs[uncachedIdx[j]] = v;
+                    if (v) cacheIconEmbedding(`icon:${candidates[uncachedIdx[j]].name}`, v);
+                  });
+                }
+                let best = null;
+                let bestScore = 0;
+                iconVecs.forEach((v, i) => {
+                  if (!v) return;
+                  const s = cosineSimilarity(groupVec, v);
+                  if (s > bestScore) {
+                    bestScore = s;
+                    best = candidates[i];
+                  }
+                });
+                if (best && bestScore >= CONFIG.AUTO_ICON_SIMILARITY_THRESHOLD) {
+                  picked = best;
+                  pickedVia = `ai ${bestScore.toFixed(3)}`;
+                  console.log(
+                    `[TabSort] Auto-icons: "${topic}" -> ${best.name} (${bestScore.toFixed(3)})`
+                  );
+                } else if (best) {
+                  console.log(
+                    `[TabSort] Auto-icons: no confident icon for "${topic}" (best ${best.name} ${bestScore.toFixed(3)} < ${CONFIG.AUTO_ICON_SIMILARITY_THRESHOLD}), leaving as-is`
+                  );
+                } else {
+                  console.log(`[TabSort] Auto-icons: no icon vectors for "${topic}", leaving as-is`);
+                }
+              } else {
+                console.log(`[TabSort] Auto-icons: no group embedding for "${topic}", leaving as-is`);
+              }
+            } else {
+              console.log(`[TabSort] Auto-icons: no candidates for "${topic}", leaving as-is`);
+            }
+          } catch (e) {
+            console.error("[TabSort] Icon embedding match failed, skipping:", e);
+          }
+        } else if (picked) {
+          console.log(`[TabSort] Auto-icons: "${topic}" -> ${picked.name} (${pickedVia})`);
+        }
+
+        if (!picked) continue;
+        const chosen = pickTablerIconUrl(picked, byName);
+        if (!chosen) continue;
+        // Re-check: user may have picked an icon while we were inferring.
+        if (groupHasIcon(group, atg)) {
+          console.log(`[TabSort] Auto-icons: "${topic}" got an icon meanwhile, skipping`);
+          continue;
+        }
+        atg.persistGroupIcon(group, chosen.url);
+        console.log(`[TabSort] Auto-icons: applied ${chosen.name} (${chosen.variant}) to "${topic}"`);
+      } catch (e) {
+        console.error("[TabSort] Failed to assign icon to group:", e);
+      }
+    }
   };
 
   // Animation cleanup utility
@@ -862,6 +1520,192 @@
     }
   };
 
+  // --- Toast notifications (zen-toast-container) ---
+  // Pattern mirrors zen-tidy-downloads `showSimpleToast` and
+  // workspace-notifications `NotificationPopups`: render into
+  // #zen-toast-container, queue while another toast (ours or another
+  // mod's) owns the container, spring in via gZenUIManager.motion,
+  // pause on hover/focus, Escape to dismiss, role=status for a11y.
+  let tidyToastQueue = [];
+  let tidyToastActive = null;
+  let tidyToastRetry = null;
+
+  const TIDY_TOAST_TIMEOUT = {
+    success: 4000,
+    error: 5500,
+    info: 3500,
+  };
+
+  function pumpTidyToastQueue() {
+    if (tidyToastActive || tidyToastRetry != null) return;
+    if (tidyToastQueue.length === 0) return;
+    const container = document.getElementById("zen-toast-container");
+    if (!container) {
+      tidyToastQueue = [];
+      return;
+    }
+    // Own only our slot: if Zen or another mod is showing a toast,
+    // retry shortly instead of stacking on top of it.
+    if (container.children.length > 0) {
+      tidyToastRetry = setTimeout(() => {
+        tidyToastRetry = null;
+        pumpTidyToastQueue();
+      }, 300);
+      return;
+    }
+    const payload = tidyToastQueue.shift();
+    const wrapper = document.createXULElement("hbox");
+    wrapper.classList.add(
+      "zen-toast",
+      "tidy-tabs-toast",
+      `tidy-tabs-toast--${payload.type}`
+    );
+    wrapper.setAttribute("role", "status");
+    wrapper.setAttribute("aria-live", "polite");
+
+    const content = document.createElement("div");
+    content.className = "tidy-tabs-toast-content";
+    const titleEl = document.createElement("div");
+    titleEl.className = "tidy-tabs-toast-title";
+    titleEl.textContent = String(payload.title || "").slice(0, 120);
+    content.appendChild(titleEl);
+    wrapper.appendChild(content);
+
+    container.removeAttribute("hidden");
+    container.appendChild(wrapper);
+
+    let timer = null;
+    let dismissed = false;
+    let finished = false;
+    const finish = () => {
+      if (finished) return;
+      finished = true;
+      try {
+        wrapper.remove();
+      } catch (_e) {}
+      if (container.children.length === 0) {
+        container.setAttribute("hidden", "true");
+      }
+      tidyToastActive = null;
+      pumpTidyToastQueue();
+    };
+    const prefersReducedMotion = () => {
+      try {
+        return window.matchMedia?.(
+          "(prefers-reduced-motion: reduce)"
+        )?.matches;
+      } catch (_e) {
+        return false;
+      }
+    };
+    const animate = (frames, options) => {
+      try {
+        if (!prefersReducedMotion() && window.gZenUIManager?.motion) {
+          return window.gZenUIManager.motion.animate(
+            wrapper,
+            frames,
+            options
+          );
+        }
+      } catch (_e) {}
+      return null;
+    };
+    const dismiss = (immediate = false) => {
+      if (dismissed) {
+        if (immediate) finish();
+        return;
+      }
+      dismissed = true;
+      if (timer) clearTimeout(timer);
+      if (immediate) {
+        finish();
+        return;
+      }
+      const out = animate(
+        { opacity: [1, 0], scale: [1, 0.5] },
+        { duration: 0.2, bounce: 0 }
+      );
+      if (out) {
+        Promise.resolve(out).then(finish, finish);
+        setTimeout(finish, 500); // safety in case motion promise hangs
+      } else {
+        finish();
+      }
+    };
+    const pause = () => {
+      if (timer) clearTimeout(timer);
+      timer = null;
+    };
+    const resume = () => {
+      pause();
+      if (!dismissed) {
+        timer = setTimeout(() => dismiss(), payload.duration);
+      }
+    };
+
+    wrapper.addEventListener("mouseenter", pause);
+    wrapper.addEventListener("mouseleave", resume);
+    wrapper.addEventListener("focusin", pause);
+    wrapper.addEventListener("focusout", resume);
+    wrapper.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") {
+        e.stopPropagation();
+        dismiss();
+      }
+    });
+    wrapper.tabIndex = 0;
+
+    tidyToastActive = { wrapper, dismiss };
+    const entrance = animate(
+      { scale: [0.8, 1], opacity: [0, 1] },
+      { type: "spring", bounce: 0.2, duration: 0.5 }
+    );
+    if (entrance) {
+      Promise.resolve(entrance).catch(() => {
+        wrapper.style.transform = "scale(1)";
+        wrapper.style.opacity = "1";
+      });
+    } else {
+      wrapper.style.transform = "scale(1)";
+    }
+    resume();
+  }
+
+  function showTidyToast(title, type = "success") {
+    try {
+      if (!title) return false;
+      if (!["success", "error", "info"].includes(type)) type = "success";
+      tidyToastQueue.push({
+        title,
+        type,
+        duration: TIDY_TOAST_TIMEOUT[type] ?? 4000,
+        id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+      });
+      if (tidyToastQueue.length > 5) tidyToastQueue.shift();
+      pumpTidyToastQueue();
+      return true;
+    } catch (e) {
+      console.error("[TabSort] Failed to show toast:", e);
+      return false;
+    }
+  }
+
+  function clearTidyToasts() {
+    try {
+      tidyToastQueue = [];
+      if (tidyToastRetry) {
+        clearTimeout(tidyToastRetry);
+        tidyToastRetry = null;
+      }
+      if (tidyToastActive) {
+        try {
+          tidyToastActive.dismiss(true);
+        } catch (_e) {}
+        tidyToastActive = null;
+      }
+    } catch (_e) {}
+  }
+
   // --- Main Sorting Function ---
   const sortTabsByTopic = async () => {
     if (isSorting) return;
@@ -885,6 +1729,7 @@
       const currentWorkspaceId = window.gZenWorkspaces?.activeWorkspace;
       if (!currentWorkspaceId) {
         console.error("Cannot get current workspace ID.");
+        showTidyToast("Nothing to tidy!", "error");
         return; // Exit early
       }
 
@@ -920,6 +1765,7 @@
       );
       if (initialTabsToSort.length === 0) {
         console.log("[TabSort] Debug - No tabs to sort, returning early");
+        showTidyToast("Nothing to tidy!", "info");
         return;
       }
 
@@ -1060,7 +1906,8 @@
 
       if (sortingFailed) {
         console.log("[TabSort] Triggering failure animation");
-        // Trigger failure animation
+        // Trigger failure animation + failure toast (like Tidy Downloads).
+        showTidyToast("Nothing to tidy!", "error");
         startFailureAnimation();
         return;
       }
@@ -1069,6 +1916,8 @@
         console.log(
           "[TabSort] Debug - No final groups, returning early (this should not happen after failure detection)"
         );
+        showTidyToast("Nothing to tidy!", "error");
+        startFailureAnimation();
         return;
       }
 
@@ -1289,8 +2138,56 @@
         console.error("Error reordering tabs (groups first):", reorderError);
         // Don't fail the whole sort if reordering fails
       }
+
+      // --- Success toast (mirrors Tidy Downloads simple toast) ---
+      try {
+        const doneGroupNames = Object.keys(finalGroups).filter(
+          (k) => Array.isArray(finalGroups[k]) && finalGroups[k].length > 0
+        );
+        const doneTabCount = doneGroupNames.reduce(
+          (n, k) => n + finalGroups[k].length,
+          0
+        );
+        if (doneGroupNames.length > 0 && doneTabCount > 0) {
+          showTidyToast("Tabs have been tidied!", "success");
+        }
+      } catch (toastError) {
+        console.error("[TabSort] Failed to build success toast:", toastError);
+      }
+
+      // --- Auto-icons: inline pass, awaited as part of the sort ---
+      // The sort doesn't finish until each group has its icon (fast in
+      // practice). Skips groups that already have an icon, so manual
+      // picks are safe. Failures here never fail the sort itself.
+      try {
+        if (getAutoIconsEnabled()) {
+          const groupsForIcons = Object.entries(finalGroups)
+            .map(([topic, tabs]) => {
+              const el = existingGroupElementsMap.get(topic);
+              if (!el || !el.isConnected) return null;
+              let titles = [];
+              try {
+                titles = (tabs || [])
+                  .filter((t) => t?.isConnected)
+                  .map((t) => getTabTitle(t))
+                  .filter(Boolean)
+                  .slice(0, 8);
+              } catch (_e) {}
+              return { element: el, topic, titles };
+            })
+            .filter(Boolean);
+          if (groupsForIcons.length > 0) {
+            await assignGroupIconsBackground(groupsForIcons);
+          } else {
+            console.log("[TabSort] Auto-icons: no groups to icon (all missing from DOM).");
+          }
+        }
+      } catch (iconError) {
+        console.error("[TabSort] Icon pass failed (sort still succeeds):", iconError);
+      }
     } catch (error) {
       console.error("Error during overall sorting process:", error);
+      showTidyToast("Nothing to tidy!", "error");
     } finally {
       // If failure animation is playing, delay the cleanup
       if (isPlayingFailureAnimation) {
@@ -1907,11 +2804,23 @@
   const cleanup = () => {
     try {
       removeMinTabsPrefObserver();
+      cancelWarmup();
       // Stop any running animations
       cleanupAnimation();
+      clearTidyToasts();
 
       // Clear DOM cache
       domCache.invalidate();
+
+      // Drop cached vectors + engine promises so a reloaded script
+      // doesn't hold stale ML runtimes.
+      embeddingCache.clear();
+      try {
+        iconEmbeddingCache.clear();
+      } catch (_e) {}
+      embeddingEnginePromise = null;
+      namerEnginePromise = null;
+      warmupStarted = false;
 
       // Reset state
       isSorting = false;
@@ -1948,6 +2857,11 @@
           setupMinTabsPrefObserver();
           updateButtonsVisibilityState();
           addTabEventListeners();
+          // Pre-load ML engines idle so the first sort skips
+          // createEngine + model-download latency.
+          try {
+            warmupMLEngines();
+          } catch (_e) {}
 
           return true;
         }
