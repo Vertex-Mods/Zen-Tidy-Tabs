@@ -5,5 +5,18 @@
     "property": "browser.ml.enable",
     "force": true,
     "defaultValue": true
+  },
+  {
+    "type": "separator",
+    "label": "Sorting"
+  },
+  {
+    "property": "zen.tidy-tabs.min-tabs-for-sort",
+    "label": "Minimum tabs required to show the sort button",
+    "type": "string",
+    "value": "number",
+    "placeholder": "6",
+    "defaultValue": 6,
+    "description": "Type how many ungrouped tabs are needed before the sort button appears. Lower this below 6 to sort with fewer tabs (e.g. 2 or 3). When tab groups already exist, the button still shows with just 1 ungrouped tab."
   }
 ]

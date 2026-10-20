@@ -39,25 +39,56 @@
   /* Only override what's necessary, let native styles handle layout */
   overflow: visible !important;
 
-  & svg {
+  /* Animated wave overlay. Absolutely positioned so it never participates
+     in flex layout or breaks the divider line. It is only visible while
+     sorting (see .separator-is-sorting below). The static divider line
+     itself is the native toolbarseparator, same as the clear button.
+     Geometry (centered 1px strip, viewBox 0 0 100 2) matches the animation
+     path data, so the wave renders undistorted. */
+  & svg.separator-line-svg {
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: 50%;
+    transform: translateY(-50%);
+    z-index: 1;
     width: 100% !important;
-    height: 1px;
+    height: 1px !important;
     min-height: 1px !important;
+    margin: 0 !important;
+    padding: 0 !important;
     display: block;
     overflow: visible;
-    transition: width 0.15s ease-in-out;
-    min-width: 0;
-    margin: auto 4px !important;
-    flex-grow: 1;
+    pointer-events: none !important;
+    opacity: 0;
+    transition: opacity 0.15s ease-in-out;
+  }
+
+  &.separator-is-sorting svg.separator-line-svg {
+    opacity: 1;
+  }
+
+  /* While the wave animation plays, hide the real static line (native
+     separator plus both buttons' segments) so only the wave shows.
+     Opacity keeps layout untouched; the class is removed when sorting
+     finishes, fading the line back in. */
+  &.separator-is-sorting toolbarseparator,
+  &.separator-is-sorting #sort-button,
+  &.separator-is-sorting .zen-workspace-close-unpinned-tabs-button {
+    opacity: 0 !important;
   }
 
   & #sort-button {
     appearance: none !important;
-    opacity: 0;
-    visibility: collapse;
-    transition:
-      opacity 0.15s,
-      visibility 0.15s;
+    /* Idle: the button IS the divider line - a real 1px bar in the separator
+       color, so the divider stays perfectly continuous (no gradient math,
+       no seams). */
+    height: 1px !important;
+    min-height: 0 !important;
+    background: var(--zen-pinned-separator-color) !important;
+    border: none !important;
+    opacity: 1;
+    visibility: visible;
     font-size: 10px !important;
     font-weight: 500;
     gap: 2px;
@@ -73,21 +104,25 @@
     -moz-context-properties: fill, fill-opacity !important;
     fill: currentColor !important;
 
-    & label {
-      display: block;
-      font-weight: 600;
-    }
-
-    & .toolbarbutton-text {
-      display: flex;
+    /* Broom icon is inline SVG (direct child, no wrappers) using the proven
+       currentColor path - data-URI context-fill does not resolve for
+       opaque-origin images and falls back to black. The empty anonymous
+       icon is hidden so only the broom paints. */
+    & .toolbarbutton-icon {
+      display: none !important;
     }
 
     & .broom-icon {
       width: 10px !important;
       height: 10px !important;
-      transition: transform 0.15s ease-in-out;
+      /* Like the native clear button icon: only the icon fades, the button
+         (idle 1px bar) always stays in layout. */
+      opacity: 0;
+      transition:
+        opacity 0.15s,
+        transform 0.15s ease-in-out;
       transform: translateY(0px);
-      /* Use currentColor to match native clear button icon color */
+      /* Use currentColor so it adapts to theme changes like native button */
       fill: currentColor !important;
     }
 
@@ -112,12 +147,14 @@
     }
 
     #navigator-toolbox[zen-has-implicit-hover="true"] & {
-      visibility: visible;
-      opacity: 0.5;
-    }
+      height: auto !important;
+      background: none !important;
+      margin-inline-start: 8px !important;
+      pointer-events: auto;
 
-    &:hover {
-      opacity: 1 !important;
+      & .broom-icon {
+        opacity: 0.5;
+      }
     }
 
     :root:not([zen-sidebar-expanded="true"]) & {
@@ -135,13 +172,20 @@
 
   &:hover {
     & #sort-button {
-      visibility: visible;
-      opacity: 0.5;
-      pointer-events: auto;
+      /* Hovered: back to a normal-height button with no fake line, icon
+         visible, and 8px breathing room on its left (matches native). */
+      height: auto !important;
+      background: none !important;
+      margin-inline-start: 8px !important;
+      pointer-events: auto !important;
       cursor: pointer !important;
+
+      & .broom-icon {
+        opacity: 0.5;
+      }
     }
 
-    & #sort-button:hover {
+    & #sort-button:hover .broom-icon {
       opacity: 1 !important;
     }
   }
@@ -174,16 +218,6 @@
   gap: 0 !important;
 }
 
-.vertical-pinned-tabs-container-separator:hover svg {
-  width: calc(
-    100% -
-      (
-        100px *
-          (1 - var(--sort-button-hidden, 0))
-      )
-  ) !important;
-}
-
 .tab-is-sorting {
   & .tab-icon-image,
   & .tab-label {
@@ -209,11 +243,5 @@
   & .separator-path-segment {
     /* Match native toolbarseparator color for light theme */
     stroke: rgba(0, 0, 0, 0.2) !important;
-  }
-}
-
-.pinned-tabs-container-separator {
-  & toolbarseparator {
-    display: none !important;
   }
 }
