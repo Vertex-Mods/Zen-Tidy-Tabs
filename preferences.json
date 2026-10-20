@@ -18,5 +18,23 @@
     "placeholder": "6",
     "defaultValue": 6,
     "description": "Type how many ungrouped tabs are needed before the sort button appears. Lower this below 6 to sort with fewer tabs (e.g. 2 or 3). When tab groups already exist, the button still shows with just 1 ungrouped tab."
+  },
+  {
+    "type": "separator",
+    "label": "Group icons"
+  },
+  {
+    "property": "zen.tidy-tabs.auto-icons",
+    "label": "Automatically assign Advanced Tab Groups icons after sorting",
+    "type": "checkbox",
+    "defaultValue": true,
+    "description": "Runs in the background after sorting finishes (no extra sort time). Skips groups that already have an icon, so manual picks are never overwritten. Turn off if you prefer plain groups."
+  },
+  {
+    "property": "zen.tidy-tabs.auto-icons-keywords",
+    "label": "Use fast keyword shortcuts for icons",
+    "type": "checkbox",
+    "defaultValue": false,
+    "description": "Off by default: the local AI embedding match runs over the full Tabler set. Turn on to let common topics match instantly first (e.g. shopping goes straight to the cart icon)."
   }
 ]
