@@ -231,6 +231,22 @@
   stroke: light-dark(rgba(0, 0, 0, 0.2), rgba(255, 255, 255, 0.2)) !important;
 }
 
+/* Library Spaces section deep-clones the real tab strips, including our
+   separator additions. The clone renames every id (sort-button becomes
+   sort-button-copy), so the #sort-button styles above no longer match and
+   the copy renders as an unstyled toolbarbutton. Hide all tidy artifacts
+   inside library cards — the library is an overview, not a sort surface. */
+.zen-library-spaces .pinned-tabs-container-separator svg.separator-line-svg,
+.zen-library-space-tabs .pinned-tabs-container-separator svg.separator-line-svg,
+.zen-library-spaces svg.separator-line-svg,
+.zen-library-space-tabs svg.separator-line-svg,
+.zen-library-spaces #sort-button,
+.zen-library-space-tabs #sort-button,
+.zen-library-spaces #sort-button-copy,
+.zen-library-space-tabs #sort-button-copy {
+  display: none !important;
+}
+
 [lwt-toolbar="light"] {
   & #sort-button {
     color: rgba(0, 0, 0, 0.6);

@@ -125,8 +125,13 @@
 
     getSeparators() {
       if (!this.separators || !this.separators.length) {
-        this.separators = document.querySelectorAll(
-          ".pinned-tabs-container-separator"
+        // The Library Spaces section deep-clones real strips into
+        // .zen-library-spaces cards (renaming ids to *-copy). Those clones
+        // must never be treated as real separators.
+        this.separators = Array.from(
+          document.querySelectorAll(".pinned-tabs-container-separator")
+        ).filter(
+          (sep) => !sep.closest(".zen-library-spaces, zen-library")
         );
       }
       return this.separators;
@@ -2266,6 +2271,13 @@
     if (!separator) {
       return;
     }
+    // Never inject into Library Spaces clones — those are read-only copies
+    // of the real strips (ids renamed to *-copy) and would render unstyled.
+    try {
+      if (separator.closest?.(".zen-library-spaces, zen-library")) {
+        return;
+      }
+    } catch (_e) {}
     try {
       const isPinnedSeparator = separator.classList?.contains(
         "pinned-tabs-container-separator"
