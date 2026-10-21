@@ -963,12 +963,28 @@
             return keywords;
           }
 
-          // Group naming function (shared singleton engine)
-          async function nameGroupWithSmartTabTopic(titles) {
-            const keywords = extractKeywords(titles);
-            const input = `Topic from keywords: ${keywords.join(
-              ", "
-            )}. titles:\n${titles.join("\n")}`;
+          // Group naming function (shared singleton engine).
+          // "Group" results come from three places, all handled below:
+          // 1) dead inference port -> engine.run throws -> retry once with a
+          //    fresh engine (previously every later group stayed "Group");
+          // 2) model returns empty/generic ("Group") -> title fallback;
+          // 3) title fallback itself empty -> "Group" (last resort only).
+          async function nameGroupWithSmartTabTopic(titles, _retried = false) {
+            // Plain titles only: this matches the input shape Mozilla's
+            // smart-tab-topic was trained on (Firefox passes concatenated
+            // titles). The old "Topic from keywords:" prefix confused the
+            // small model into generic outputs.
+            const input = (titles || []).join("\n").slice(0, 1000);
+
+            const titleFallback = () => {
+              const fb = String(titles?.[0] || "")
+                .split("–")[0]
+                .trim()
+                .slice(0, 24)
+                .replace(/^['"`]+|['"`]+$/g, "")
+                .replace(/[.?!,:;]+$/, "");
+              return fb || "Group";
+            };
 
             try {
               const engine = await getNamerEngine();
@@ -978,24 +994,45 @@
                 options: { max_new_tokens: 8, temperature: 0.7 },
               });
 
-              let name = (aiResult[0]?.generated_text || "Group")
+              const raw = aiResult?.[0]?.generated_text;
+              let name = String(raw || "")
                 .split("\n")
                 .map((l) => l.trim())
                 .find((l) => l);
 
+              console.log(
+                `[TabSort][AI] Topic model raw output for [${(titles || []).slice(0, 3).join(" | ")}]:`,
+                JSON.stringify(raw ?? null)
+              );
+
               name = toTitleCase(name);
-              if (!name || /none|adult content/i.test(name)) {
-                name = titles[0].split("–")[0].trim().slice(0, 24);
+              if (!name || /^(group|untitled|new tab)?$|none|adult content/i.test(name)) {
+                console.log(
+                  `[TabSort][AI] Topic model gave unusable name (${JSON.stringify(name)}), using title fallback`
+                );
+                return titleFallback();
               }
 
               name = name
                 .replace(/^['"`]+|['"`]+$/g, "")
                 .replace(/[.?!,:;]+$/, "")
                 .slice(0, 24);
-              return name || "Group";
+              return name || titleFallback();
             } catch (e) {
               console.error("[TabSort][AI] Error naming group:", e);
-              return "Group";
+              // Dead port / crashed inference process: drop the singleton
+              // and retry once, mirroring embedTexts.
+              namerEnginePromise = null;
+              const msg = String(e?.message ?? e ?? "");
+              if (!_retried && /port does not exist|port closed|message port/i.test(msg)) {
+                console.log("[TabSort][AI] Retrying group naming with a fresh engine...");
+                try {
+                  return await nameGroupWithSmartTabTopic(titles, true);
+                } catch (retryErr) {
+                  console.error("[TabSort][AI] Naming retry failed:", retryErr);
+                }
+              }
+              return titleFallback();
             }
           }
 
