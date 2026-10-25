@@ -21,7 +21,13 @@
     AUTO_ICON_MAX_CANDIDATES: 24, // Max Tabler candidates to embedding-rerank per group
     ICON_EMBEDDING_CACHE_LIMIT: 300,
     WARMUP_DELAY_MS: 20000, // Idle delay after init before pre-loading ML engines (lets startup fully settle)
-    WARMUP_ENABLED: true, // Pre-create engines at startup so first sort is fast
+    WARMUP_ENABLED: true, // Pre-create engines at startup so first sort is fast,
+    // --- Workspace suggestions prototype (sidebar notification, not toast) ---
+    WORKSPACE_SUGGEST_ENABLED: true, // Suggest better workspaces after sort finishes
+    WORKSPACE_SUGGEST_THRESHOLD: 0.55, // Lowered sensitivity: min similarity to a foreign workspace
+    WORKSPACE_SUGGEST_MARGIN: 0.12, // Must beat current-workspace similarity by this much
+    WORKSPACE_SUGGEST_MAX: 3, // Max suggestion rows per notification (avoids clutter)
+    WORKSPACE_PROFILE_CACHE_LIMIT: 20,
   };
 
   // --- Ensure Firefox's local ML engine is enabled ---
@@ -40,6 +46,8 @@
   const MIN_TABS_PREF = "zen.tidy-tabs.min-tabs-for-sort";
   const AUTO_ICONS_PREF = "zen.tidy-tabs.auto-icons";
   const AUTO_ICON_KEYWORDS_PREF = "zen.tidy-tabs.auto-icons-keywords";
+  const WORKSPACE_SUGGEST_PREF = "zen.tidy-tabs.workspace-suggest";
+  const WORKSPACE_NAME_ONLY_PREF = "zen.tidy-tabs.workspace-name-only";
 
   // User-configurable minimum tab count for the sort button to appear.
   // The user can type any amount (including less than 6) in the mod settings.
@@ -100,6 +108,56 @@
     } catch (e) {
       console.error("[TabSort] Error reading auto-icon keywords pref:", e);
       return false;
+    }
+  };
+
+  const getWorkspaceSuggestEnabled = () => {
+    try {
+      if (typeof Services === "undefined" || !Services.prefs)
+        return CONFIG.WORKSPACE_SUGGEST_ENABLED;
+      try {
+        return Services.prefs.getBoolPref(
+          WORKSPACE_SUGGEST_PREF,
+          CONFIG.WORKSPACE_SUGGEST_ENABLED
+        );
+      } catch (_e) {
+        return CONFIG.WORKSPACE_SUGGEST_ENABLED;
+      }
+    } catch (e) {
+      console.error("[TabSort] Error reading workspace-suggest pref:", e);
+      return CONFIG.WORKSPACE_SUGGEST_ENABLED;
+    }
+  };
+
+  // When true, workspace profiles embed only the workspace name,
+  // ignoring pinned tabs (stricter, less noisy).
+  const getWorkspaceNameOnly = () => {
+    try {
+      if (typeof Services === "undefined" || !Services.prefs) return false;
+      try {
+        return Services.prefs.getBoolPref(WORKSPACE_NAME_ONLY_PREF, false);
+      } catch (_e) {
+        return false;
+      }
+    } catch (e) {
+      console.error("[TabSort] Error reading workspace-name-only pref:", e);
+      return false;
+    }
+  };
+
+  const getTabIconURL = (tab) => {
+    try {
+      if (!tab?.isConnected) return "";
+      // Firefox tab favicon: image attribute is the most reliable.
+      const attrImg = tab.getAttribute?.("image") || "";
+      if (attrImg && !attrImg.includes("chrome://")) return attrImg;
+      const imgEl =
+        tab.querySelector?.(".tab-icon-image, image.tab-icon-image");
+      const src = imgEl?.src || imgEl?.getAttribute?.("src") || "";
+      if (src && !src.includes("chrome://")) return src;
+      return attrImg || "";
+    } catch (_e) {
+      return "";
     }
   };
 
@@ -1560,10 +1618,513 @@
           continue;
         }
         atg.persistGroupIcon(group, chosen.url);
-        console.log(`[TabSort] Auto-icons: applied ${chosen.name} (${chosen.variant}) to "${topic}"`);
+          console.log(`[TabSort] Auto-icons: applied ${chosen.name} (${chosen.variant}) to "${topic}"`);
       } catch (e) {
         console.error("[TabSort] Failed to assign icon to group:", e);
       }
+    }
+  };
+
+  // --- Workspace suggestions prototype (sidebar notification, not toast) ---
+  // Goal: suggest a *better workspace* for tabs, based on:
+  //   workspace name + its pinned tabs (averaged embedding)
+  // vs. each tab title embedding. Persistent UI modeled on
+  // ZenSidebarNotification (inserted after #zen-media-controls-toolbar,
+  // animated via gZenUIManager.motion, close button, no auto-hide),
+  // but with raw text so uc.js doesn't need fluent strings.
+  // Deliberately NOT anchored per-tab (would clutter) and NOT a toast
+  // (temporary). One notification, up to WORKSPACE_SUGGEST_MAX rows.
+  const workspaceProfileCache = new Map();
+
+  const getAllWorkspaceInfos = () => {
+    try {
+      const ws = window.gZenWorkspaces;
+      if (!ws || typeof ws.getWorkspaces !== "function") return [];
+      const list = ws.getWorkspaces() || [];
+      return list
+        .filter((w) => w && (w.uuid || w.id) && w.name)
+        .map((w) => ({
+          uuid: w.uuid || w.id,
+          name: String(w.name || "").trim(),
+          icon: w.icon || "",
+        }))
+        .filter((w) => w.uuid && w.name);
+    } catch (e) {
+      console.error("[TabSort][Workspaces] Failed to list workspaces:", e);
+      return [];
+    }
+  };
+
+  const getWorkspacePinnedTitles = (workspaceUuid, max = 8) => {
+    try {
+      const el = window.gZenWorkspaces?.workspaceElement?.(workspaceUuid);
+      const container = el?.pinnedTabsContainer;
+      if (!container) return [];
+      const tabs = Array.from(container.querySelectorAll("tab")).filter(
+        (t) => t?.isConnected && !t.hasAttribute("zen-empty-tab")
+      );
+      return tabs
+        .map((t) => {
+          try {
+            return getTabTitle(t);
+          } catch (_e) {
+            return "";
+          }
+        })
+        .filter((s) => s && s !== "Untitled Page" && s !== "New Tab")
+        .slice(0, max);
+    } catch (e) {
+      console.error("[TabSort][Workspaces] Failed to read pinned tabs:", e);
+      return [];
+    }
+  };
+
+  const getWorkspaceProfileTexts = (workspaceUuid, workspaceName) => {
+    const name = String(workspaceName || "").trim().slice(0, 256);
+    // Name-only mode: strict, workspace title decides alone.
+    if (getWorkspaceNameOnly()) {
+      return name ? [name] : [];
+    }
+    const pinned = getWorkspacePinnedTitles(workspaceUuid);
+    // Name first (acts as topic anchor), then pinned tabs as context.
+    const texts = [name, ...pinned]
+      .filter(Boolean)
+      .map((s) => String(s).slice(0, 256))
+      .slice(0, 10);
+    return texts;
+  };
+
+  const getWorkspaceProfileEmbedding = async (workspaceUuid, workspaceName) => {
+    const texts = getWorkspaceProfileTexts(workspaceUuid, workspaceName);
+    if (texts.length === 0) return null;
+    const cacheKey = `${workspaceUuid}::${texts.join("|").slice(0, 512)}`;
+    try {
+      if (workspaceProfileCache.has(workspaceUuid)) {
+        const cached = workspaceProfileCache.get(workspaceUuid);
+        if (cached && cached.key === cacheKey && Array.isArray(cached.vec)) {
+          return cached.vec;
+        }
+      }
+    } catch (_e) {}
+    try {
+      const vecs = await getEmbeddingsForTitles(texts, CONFIG.EMBEDDING_BATCH_SIZE);
+      const valid = (vecs || []).filter((v) => Array.isArray(v) && v.length > 0);
+      if (valid.length === 0) return null;
+      const avg = averageEmbedding(valid);
+      if (!Array.isArray(avg) || avg.length === 0) return null;
+      try {
+        if (workspaceProfileCache.size >= CONFIG.WORKSPACE_PROFILE_CACHE_LIMIT) {
+          const oldest = workspaceProfileCache.keys().next().value;
+          workspaceProfileCache.delete(oldest);
+        }
+        workspaceProfileCache.set(workspaceUuid, { key: cacheKey, vec: avg });
+      } catch (_e) {}
+      return avg;
+    } catch (e) {
+      console.error(`[TabSort][Workspaces] Embedding failed for "${workspaceName}":`, e);
+      return null;
+    }
+  };
+
+  const suggestBetterWorkspacesForTabs = async (tabs, currentWorkspaceId) => {
+    if (!getWorkspaceSuggestEnabled()) return [];
+    if (!Array.isArray(tabs) || tabs.length === 0) return [];
+    if (!currentWorkspaceId) return [];
+    try {
+      const infos = getAllWorkspaceInfos();
+      if (infos.length < 2) {
+        console.log("[TabSort][Workspaces] Need 2+ named workspaces to suggest, found:", infos.length);
+        return [];
+      }
+      // Profile embeddings for every workspace (cached per uuid+texts).
+      const profileVecs = new Map();
+      for (const info of infos) {
+        const vec = await getWorkspaceProfileEmbedding(info.uuid, info.name);
+        if (vec) profileVecs.set(info.uuid, { info, vec });
+      }
+      if (!profileVecs.has(currentWorkspaceId)) {
+        console.log("[TabSort][Workspaces] No profile for current workspace, skipping");
+        return [];
+      }
+      if (profileVecs.size < 2) {
+        console.log("[TabSort][Workspaces] Fewer than 2 workspace profiles with embeddings");
+        return [];
+      }
+      const currentVec = profileVecs.get(currentWorkspaceId).vec;
+      const validTabs = tabs.filter((t) => t?.isConnected);
+      if (validTabs.length === 0) return [];
+      const tabTitles = validTabs.map((t) => getTabTitle(t));
+      const tabVecs = await getEmbeddingsForTitles(tabTitles, CONFIG.EMBEDDING_BATCH_SIZE);
+      const out = [];
+      for (let i = 0; i < validTabs.length; i++) {
+        const tabVec = tabVecs[i];
+        if (!Array.isArray(tabVec) || tabVec.length === 0) continue;
+        const currentSim = cosineSimilarity(tabVec, currentVec);
+        let best = null;
+        for (const [uuid, { info, vec }] of profileVecs) {
+          if (uuid === currentWorkspaceId) continue;
+          const sim = cosineSimilarity(tabVec, vec);
+          if (!best || sim > best.sim) best = { uuid, info, sim };
+        }
+        if (!best) continue;
+        const margin = best.sim - (Number.isFinite(currentSim) ? currentSim : 0);
+        if (
+          best.sim >= CONFIG.WORKSPACE_SUGGEST_THRESHOLD &&
+          margin >= CONFIG.WORKSPACE_SUGGEST_MARGIN
+        ) {
+          out.push({
+            tab: validTabs[i],
+            tabTitle: tabTitles[i],
+            tabIcon: getTabIconURL(validTabs[i]),
+            fromWorkspaceId: currentWorkspaceId,
+            toWorkspaceId: best.uuid,
+            toWorkspaceName: best.info.name,
+            toWorkspaceIcon: best.info.icon,
+            similarity: best.sim,
+            currentSimilarity: currentSim,
+          });
+        }
+      }
+      out.sort((a, b) => b.similarity - a.similarity);
+      const sliced = out.slice(0, CONFIG.WORKSPACE_SUGGEST_MAX);
+      console.log(
+        `[TabSort][Workspaces] ${out.length} candidate(s), showing ${sliced.length}:`,
+        sliced.map((s) => `"${s.tabTitle}" -> "${s.toWorkspaceName}" (${s.similarity.toFixed(3)} vs current ${Number(s.currentSimilarity).toFixed(3)})`)
+      );
+      return sliced;
+    } catch (e) {
+      console.error("[TabSort][Workspaces] Suggestion pass failed:", e);
+      return [];
+    }
+  };
+
+  const clearWorkspaceSuggestions = (animate = false) => {
+    try {
+      const existing = document.querySelectorAll(".tidy-workspace-suggestion");
+      existing.forEach((el) => {
+        try {
+          if (!el?.isConnected) {
+            el.remove();
+            return;
+          }
+          if (animate && window.gZenUIManager?.motion) {
+            try {
+              const out = window.gZenUIManager.motion.animate(
+                el,
+                { opacity: [1, 0], y: [0, 10] },
+                {}
+              );
+              Promise.resolve(out).then(
+                () => el.remove(),
+                () => el.remove()
+              );
+              setTimeout(() => {
+                try {
+                  if (el.isConnected) el.remove();
+                } catch (_e) {}
+              }, 500);
+            } catch (_e) {
+              el.remove();
+            }
+          } else {
+            el.remove();
+          }
+        } catch (_e) {}
+      });
+    } catch (_e) {}
+  };
+
+  // Sidebar-notification-style, persistent (no auto-hide). Inserted after
+  // #zen-media-controls-toolbar like ZenSidebarNotification. Raw text
+  // (no fluent) so uc.js can show dynamic tab/workspace names.
+  const showWorkspaceSuggestionsNotification = (suggestions) => {
+    if (!Array.isArray(suggestions) || suggestions.length === 0) return null;
+    try {
+      clearWorkspaceSuggestions(false);
+      const sibling = document.getElementById("zen-media-controls-toolbar");
+      if (!sibling) {
+        console.warn("[TabSort][Workspaces] No #zen-media-controls-toolbar, falling back to toast");
+        showTidyToast(`${suggestions.length} tab(s) may belong in another workspace`, "info");
+        return null;
+      }
+      try {
+        if (window.gZenVerticalTabsManager && window.gZenVerticalTabsManager._prefsSidebarExpanded === false) {
+          console.log("[TabSort][Workspaces] Sidebar collapsed — showing notification anyway (prototype differs from upstream which returns null)");
+        }
+      } catch (_e) {}
+
+      const wrapper = document.createXULElement("vbox");
+      wrapper.classList.add("zen-sidebar-notification", "tidy-workspace-suggestion");
+      wrapper.setAttribute("role", "status");
+      wrapper.setAttribute("aria-live", "polite");
+
+      const header = document.createElement("div");
+      header.className = "zen-sidebar-notification-header tidy-workspace-suggestion-header";
+
+      const heading = document.createElement("label");
+      heading.className = "zen-sidebar-notification-heading tidy-workspace-suggestion-heading";
+      heading.setAttribute("flex", "1");
+      heading.textContent =
+        suggestions.length === 1
+          ? "Tab may belong in another workspace"
+          : `${suggestions.length} tabs may belong elsewhere`;
+      header.appendChild(heading);
+
+      const closeBtn = document.createElement("div");
+      closeBtn.className = "zen-sidebar-notification-close-button";
+      closeBtn.setAttribute("role", "button");
+      closeBtn.setAttribute("tabindex", "0");
+      closeBtn.setAttribute("title", "Dismiss");
+      closeBtn.setAttribute("aria-label", "Dismiss workspace suggestions");
+      // Text fallback stays visible if the close.svg fails to load.
+      const closeFallback = document.createElement("span");
+      closeFallback.textContent = "✕";
+      closeFallback.setAttribute("aria-hidden", "true");
+      const closeImg = document.createElement("img");
+      closeImg.src = "chrome://browser/skin/zen-icons/close.svg";
+      closeImg.alt = "";
+      closeImg.addEventListener("error", () => {
+        try {
+          closeImg.remove();
+        } catch (_e) {}
+      });
+      closeImg.addEventListener("load", () => {
+        try {
+          closeFallback.remove();
+        } catch (_e) {}
+      });
+      closeBtn.appendChild(closeFallback);
+      closeBtn.appendChild(closeImg);
+      const dismissNotification = () => {
+        try {
+          if (window.gZenUIManager?.motion) {
+            const out = window.gZenUIManager.motion.animate(
+              wrapper,
+              { opacity: [1, 0], y: [0, 10] },
+              {}
+            );
+            Promise.resolve(out).then(
+              () => wrapper.remove(),
+              () => wrapper.remove()
+            );
+            setTimeout(() => {
+              try {
+                if (wrapper.isConnected) wrapper.remove();
+              } catch (_e) {}
+            }, 500);
+          } else {
+            wrapper.remove();
+          }
+        } catch (_e) {
+          try {
+            wrapper.remove();
+          } catch (_e2) {}
+        }
+      };
+      closeBtn.addEventListener("click", dismissNotification);
+      closeBtn.addEventListener("keydown", (ev) => {
+        if (ev.key === "Enter" || ev.key === " " || ev.key === "Escape") {
+          ev.preventDefault();
+          ev.stopPropagation();
+          dismissNotification();
+        }
+      });
+      header.appendChild(closeBtn);
+      wrapper.appendChild(header);
+
+      const body = document.createElement("div");
+      body.className = "zen-sidebar-notification-body tidy-workspace-suggestion-body";
+
+      const removeRowIfEmpty = () => {
+        try {
+          const rows = body.querySelectorAll(":scope > .tidy-workspace-row");
+          if (rows.length === 0 && wrapper.isConnected) {
+            wrapper.remove();
+          }
+        } catch (_e) {}
+      };
+
+      const moveTabForSuggestion = (s, row) => {
+        try {
+          const ws = window.gZenWorkspaces;
+          let moved = false;
+          try {
+            if (
+              ws &&
+              typeof ws.moveTabsToWorkspace === "function" &&
+              s.tab?.isConnected
+            ) {
+              moved = !!ws.moveTabsToWorkspace([s.tab], s.toWorkspaceId);
+            } else if (
+              ws &&
+              typeof ws.moveTabToWorkspace === "function" &&
+              s.tab?.isConnected
+            ) {
+              moved = !!ws.moveTabToWorkspace(s.tab, s.toWorkspaceId);
+            }
+          } catch (moveErr) {
+            console.error("[TabSort][Workspaces] Move failed:", moveErr);
+          }
+          if (moved) {
+            showTidyToast(
+              `Moved "${String(s.tabTitle).slice(0, 40)}" → ${s.toWorkspaceName}`,
+              "success"
+            );
+          } else {
+            showTidyToast(
+              `Could not move "${String(s.tabTitle).slice(0, 40)}"`,
+              "error"
+            );
+          }
+        } catch (e) {
+          console.error("[TabSort][Workspaces] Move handler failed:", e);
+        }
+        try {
+          row.remove();
+        } catch (_e) {}
+        removeRowIfEmpty();
+      };
+
+      for (const s of suggestions) {
+        const row = document.createElement("div");
+        row.className =
+          "zen-sidebar-notification-link-container tidy-workspace-row";
+        row.setAttribute("role", "button");
+        row.setAttribute("tabindex", "0");
+        row.title = `Move to ${s.toWorkspaceName}`;
+
+        // Tab favicon (not the ⇄ placeholder). Fall back to workspace
+        // emoji/icon letter only when the tab has no favicon.
+        const iconWrap = document.createElement("span");
+        iconWrap.className = "tidy-workspace-row-icon";
+        if (s.tabIcon) {
+          const fav = document.createElement("img");
+          fav.className = "tidy-workspace-row-favicon";
+          fav.src = s.tabIcon;
+          fav.alt = "";
+          fav.decoding = "async";
+          // If the favicon 404s after the tab navigated, drop it rather
+          // than showing a broken image.
+          fav.addEventListener("error", () => {
+            try {
+              fav.remove();
+              const fallback = document.createElement("span");
+              fallback.textContent =
+                s.toWorkspaceIcon && s.toWorkspaceIcon.length <= 4
+                  ? s.toWorkspaceIcon
+                  : "⇄";
+              iconWrap.appendChild(fallback);
+            } catch (_e) {}
+          });
+          iconWrap.appendChild(fav);
+        } else {
+          iconWrap.textContent =
+            s.toWorkspaceIcon && s.toWorkspaceIcon.length <= 4
+              ? s.toWorkspaceIcon
+              : "⇄";
+        }
+        row.appendChild(iconWrap);
+
+        const textWrap = document.createElement("div");
+        textWrap.className = "tidy-workspace-row-texts";
+        const tabLabel = document.createElement("label");
+        tabLabel.className =
+          "zen-sidebar-notification-link-text tidy-workspace-row-tab";
+        tabLabel.textContent = String(s.tabTitle || "Untitled").slice(0, 80);
+        tabLabel.title = String(s.tabTitle || "");
+        // Line 2 stays the same on hover — CSS only shifts its color.
+        const destLabel = document.createElement("label");
+        destLabel.className = "tidy-workspace-row-dest";
+        destLabel.textContent = `→ ${s.toWorkspaceName}`;
+        destLabel.title = `Similarity ${s.similarity.toFixed(3)} vs current ${Number(s.currentSimilarity).toFixed(3)}`;
+        textWrap.appendChild(tabLabel);
+        textWrap.appendChild(destLabel);
+        row.appendChild(textWrap);
+
+        const dismissBtn = document.createElement("div");
+        dismissBtn.className = "tidy-workspace-row-dismiss";
+        dismissBtn.setAttribute("role", "button");
+        dismissBtn.setAttribute("title", "Dismiss this suggestion");
+        dismissBtn.setAttribute("tabindex", "0");
+        dismissBtn.textContent = "✕";
+        dismissBtn.addEventListener("click", (ev) => {
+          ev.stopPropagation();
+          try {
+            row.remove();
+          } catch (_e) {}
+          removeRowIfEmpty();
+        });
+        dismissBtn.addEventListener("keydown", (ev) => {
+          if (ev.key === "Enter" || ev.key === " ") {
+            ev.preventDefault();
+            ev.stopPropagation();
+            try {
+              row.remove();
+            } catch (_e) {}
+            removeRowIfEmpty();
+          }
+        });
+        row.appendChild(dismissBtn);
+
+        // Whole row moves (no separate Move button).
+        row.addEventListener("click", () => moveTabForSuggestion(s, row));
+        row.addEventListener("keydown", (ev) => {
+          if (ev.key === "Enter" || ev.key === " ") {
+            ev.preventDefault();
+            moveTabForSuggestion(s, row);
+          }
+        });
+
+        body.appendChild(row);
+      }
+
+      wrapper.appendChild(body);
+      sibling.insertAdjacentElement("afterend", wrapper);
+
+      // Animate in like ZenSidebarNotification.#animateIn
+      try {
+        wrapper.style.opacity = "0";
+        if (window.gZenUIManager?.motion) {
+          const entrance = window.gZenUIManager.motion.animate(
+            wrapper,
+            { opacity: [0, 1], y: [50, 0] },
+            { delay: 1 }
+          );
+          Promise.resolve(entrance).catch(() => {
+            wrapper.style.opacity = "1";
+          });
+        } else {
+          wrapper.style.opacity = "1";
+        }
+      } catch (_e) {
+        try {
+          wrapper.style.opacity = "1";
+        } catch (_e2) {}
+      }
+      console.log(`[TabSort][Workspaces] Sidebar notification shown (${suggestions.length} suggestion(s))`);
+      return wrapper;
+    } catch (e) {
+      console.error("[TabSort][Workspaces] Failed to show sidebar notification:", e);
+      return null;
+    }
+  };
+
+  // Fire-and-forget wrapper called after sort. Never throws, never blocks.
+  const runWorkspaceSuggestionsAfterSort = async (tabs, currentWorkspaceId) => {
+    if (!getWorkspaceSuggestEnabled()) return;
+    try {
+      clearWorkspaceSuggestions(false);
+      if (!Array.isArray(tabs) || tabs.length === 0) return;
+      const liveTabs = tabs.filter((t) => t?.isConnected);
+      if (liveTabs.length === 0) return;
+      const suggestions = await suggestBetterWorkspacesForTabs(liveTabs, currentWorkspaceId);
+      if (suggestions.length > 0) {
+        showWorkspaceSuggestionsNotification(suggestions);
+      } else {
+        console.log("[TabSort][Workspaces] No better-workspace suggestions");
+      }
+    } catch (e) {
+      console.error("[TabSort][Workspaces] After-sort pass failed (sort still succeeds):", e);
     }
   };
 
@@ -2347,6 +2908,38 @@
       } catch (iconError) {
         console.error("[TabSort] Icon pass failed (sort still succeeds):", iconError);
       }
+
+      // --- Workspace suggestions: persistent sidebar notification (prototype) ---
+      // Runs after sort+icons, fire-and-forget. Uses the same tabs we tried
+      // to sort; tabs that fit nowhere locally are the best cross-workspace
+      // candidates. Never fails the sort.
+      try {
+        if (getWorkspaceSuggestEnabled()) {
+          // initialTabsToSort is in scope here; fall back to live ungrouped set.
+          let suggestTabs = [];
+          try {
+            suggestTabs = Array.isArray(initialTabsToSort)
+              ? initialTabsToSort.filter((t) => t?.isConnected)
+              : [];
+          } catch (_e) {}
+          if (suggestTabs.length === 0) {
+            try {
+              suggestTabs = getFilteredTabs(currentWorkspaceId, {
+                includeGrouped: false,
+                includeSelected: true,
+                includePinned: false,
+                includeEmpty: false,
+                includeGlance: false,
+              });
+            } catch (_e) {}
+          }
+          if (suggestTabs.length > 0) {
+            await runWorkspaceSuggestionsAfterSort(suggestTabs, currentWorkspaceId);
+          }
+        }
+      } catch (wsError) {
+        console.error("[TabSort][Workspaces] Suggestion hook failed (sort still succeeds):", wsError);
+      }
     } catch (error) {
       console.error("Error during overall sorting process:", error);
       showTidyToast("Nothing to tidy!", "error");
@@ -2917,6 +3510,13 @@
         "zen-workspace-switched",
         updateVisibilityDebounced
       );
+      // Prototype: stale cross-workspace suggestions must not linger
+      // after the user switches spaces.
+      window.addEventListener("zen-workspace-switched", () => {
+        try {
+          clearWorkspaceSuggestions(false);
+        } catch (_e) {}
+      });
     }
 
     eventListenersAdded = true;
@@ -2977,6 +3577,12 @@
       // Stop any running animations
       cleanupAnimation();
       clearTidyToasts();
+      try {
+        clearWorkspaceSuggestions(false);
+      } catch (_e) {}
+      try {
+        workspaceProfileCache.clear();
+      } catch (_e) {}
 
       // Clear DOM cache
       domCache.invalidate();

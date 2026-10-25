@@ -36,5 +36,23 @@
     "type": "checkbox",
     "defaultValue": false,
     "description": "Off by default: the local AI embedding match runs over the full Tabler set. Turn on to let common topics match instantly first (e.g. shopping goes straight to the cart icon)."
+  },
+  {
+    "type": "separator",
+    "label": "Workspace suggestions"
+  },
+  {
+    "property": "zen.tidy-tabs.workspace-suggest",
+    "label": "Suggest better workspaces after sorting",
+    "type": "checkbox",
+    "defaultValue": true,
+    "description": "After sorting, show a persistent sidebar card for tabs that look like they belong in another workspace (based on workspace name + pinned tabs). Click a row to move it, X to dismiss. Never auto-moves."
+  },
+  {
+    "property": "zen.tidy-tabs.workspace-name-only",
+    "label": "Match workspaces by name only",
+    "type": "checkbox",
+    "defaultValue": false,
+    "description": "On: embed only the workspace name (stricter, fewer suggestions). Off: embed workspace name plus pinned tab titles (more context, more suggestions)."
   }
 ]

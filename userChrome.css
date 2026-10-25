@@ -262,6 +262,196 @@
   }
 }
 
+/* Tidy workspace suggestions — persistent sidebar notification prototype.
+   Mirrors ZenSidebarNotification (inserted after #zen-media-controls-toolbar)
+   but uses raw text so uc.js can show dynamic tab/workspace names. Unlike
+   .tidy-tabs-toast this has no auto-hide: it stays until Move/Dismiss/close
+   or workspace switch. :host styles from zen-sidebar-notification.css are
+   copied here because we use our own .tidy-workspace-suggestion class. */
+.tidy-workspace-suggestion {
+  background: var(--zen-sidebar-notification-bg, var(--toolbar-bgcolor, rgba(30, 30, 32, 0.9))) !important;
+  display: flex !important;
+  flex-direction: column !important;
+  min-width: 0 !important;
+  border-radius: var(--border-radius-medium, 8px) !important;
+  outline: var(--zen-sidebar-notification-outline, 1px solid rgba(255, 255, 255, 0.1)) !important;
+  outline-offset: -1.5px !important;
+  box-shadow: var(--zen-sidebar-notification-shadow, 0 4px 16px rgba(0, 0, 0, 0.35)) !important;
+  font-size: 12px !important;
+  margin: 8px 4px 0 !important;
+
+  /* --- Header / heading / close: copied from
+     zen-sidebar-notification.css (upstream renders inside Lit shadow
+     DOM, so those rules never apply to our light-DOM vbox). --- */
+  & .tidy-workspace-suggestion-header {
+    display: flex !important;
+    position: relative !important;
+    flex: 1 !important;
+    padding: 16px !important;
+    border-bottom: 1px solid color-mix(in srgb, currentColor 10%, transparent) !important;
+  }
+
+  & .tidy-workspace-suggestion-heading {
+    text-align: center !important;
+    overflow: hidden !important;
+    text-overflow: ellipsis !important;
+    white-space: nowrap !important;
+    font-weight: 500 !important;
+    flex: 1 !important;
+    position: absolute !important;
+    top: 50% !important;
+    left: 0 !important;
+    transform: translateY(-50%) !important;
+    width: calc(100% - 40px) !important;
+    padding: 0 16px !important;
+  }
+
+  & .zen-sidebar-notification-close-button {
+    position: absolute !important;
+    right: 2px !important;
+    top: 2px !important;
+    border-radius: 4px !important;
+    border-top-right-radius: calc(var(--border-radius-medium, 8px) - 2px) !important;
+    z-index: 1 !important;
+    padding: 4px !important;
+    width: 18px !important;
+    height: 18px !important;
+    min-width: 18px !important;
+    min-height: 18px !important;
+    cursor: pointer !important;
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    opacity: 0.4 !important;
+    font-size: 12px !important;
+    line-height: 1 !important;
+
+    &:hover {
+      opacity: 1 !important;
+      background: color-mix(in srgb, currentColor 15%, transparent) !important;
+    }
+
+    & img {
+      -moz-context-properties: fill, fill-opacity !important;
+      fill-opacity: 1 !important;
+      fill: currentColor !important;
+      width: 14px !important;
+      height: 14px !important;
+      pointer-events: none !important;
+    }
+  }
+
+  & .tidy-workspace-suggestion-body {
+    padding: 6px !important;
+    display: flex !important;
+    flex-direction: column !important;
+    gap: 2px !important;
+  }
+
+  & .tidy-workspace-row {
+    cursor: pointer !important;
+    padding: 4px !important;
+    display: flex !important;
+    gap: 6px !important;
+    align-items: center !important;
+    border-radius: 6px !important;
+    opacity: 0.7 !important;
+    transition: opacity 0.2s ease-in-out !important;
+
+    &:hover {
+      opacity: 1 !important;
+      background: color-mix(in srgb, currentColor 8%, transparent) !important;
+    }
+
+    &:focus-visible {
+      opacity: 1 !important;
+      outline: 2px solid var(--zen-primary-color, #0060df) !important;
+      outline-offset: -2px !important;
+    }
+  }
+
+  & .tidy-workspace-row-icon {
+    font-size: 14px !important;
+    flex-shrink: 0 !important;
+    width: var(--size-item-small, 16px) !important;
+    height: var(--size-item-small, 16px) !important;
+    text-align: center !important;
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    pointer-events: none !important;
+  }
+
+  & .tidy-workspace-row-favicon {
+    width: var(--size-item-small, 16px) !important;
+    height: var(--size-item-small, 16px) !important;
+    border-radius: 4px !important;
+    flex-shrink: 0 !important;
+    pointer-events: none !important;
+  }
+
+  & .tidy-workspace-row-texts {
+    flex: 1 !important;
+    min-width: 0 !important;
+    display: flex !important;
+    flex-direction: column !important;
+    gap: 1px !important;
+  }
+
+  & .tidy-workspace-row-tab {
+    font-weight: 600 !important;
+    overflow: hidden !important;
+    text-overflow: ellipsis !important;
+    white-space: nowrap !important;
+  }
+
+  & .tidy-workspace-row-dest {
+    opacity: 0.75 !important;
+    overflow: hidden !important;
+    text-overflow: ellipsis !important;
+    white-space: nowrap !important;
+  }
+
+  /* Secondary text stays the same on hover — only its color shifts
+     to signal the row is actionable (row click moves the tab). */
+  & .tidy-workspace-row:hover .tidy-workspace-row-dest,
+  & .tidy-workspace-row:focus-visible .tidy-workspace-row-dest,
+  & .tidy-workspace-row:focus-within .tidy-workspace-row-dest {
+    opacity: 1 !important;
+    color: var(--zen-primary-color, #74c0fc) !important;
+  }
+
+  /* Per-row X is hover-only: hidden until its own row is hovered /
+     focused, so the list stays clean. Layout is preserved (opacity
+     only) to avoid shifting rows when the X appears. */
+  & .tidy-workspace-row-dismiss {
+    flex-shrink: 0 !important;
+    cursor: pointer !important;
+    opacity: 0 !important;
+    pointer-events: none !important;
+    padding: 2px 6px !important;
+    border-radius: 4px !important;
+
+    &:hover {
+      opacity: 1 !important;
+      background: color-mix(in srgb, currentColor 15%, transparent) !important;
+    }
+  }
+
+  & .tidy-workspace-row:hover .tidy-workspace-row-dismiss,
+  & .tidy-workspace-row:focus-within .tidy-workspace-row-dismiss,
+  & .tidy-workspace-row-dismiss:focus-visible {
+    opacity: 0.5 !important;
+    pointer-events: auto !important;
+  }
+
+  & .tidy-workspace-row:hover .tidy-workspace-row-dismiss:hover,
+  & .tidy-workspace-row .tidy-workspace-row-dismiss:hover {
+    opacity: 1 !important;
+  }
+  }
+}
+
 /* Tidy Tabs toasts — mirrors zen-tidy-downloads (.zen-toast) +
    workspace-notifications (.wn-toast) pattern:
    hbox.zen-toast in #zen-toast-container, spring via
