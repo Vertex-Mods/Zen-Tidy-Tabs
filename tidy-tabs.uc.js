@@ -19,6 +19,7 @@
     AUTO_ICON_DELAY_MS: 800, // Wait after sort finishes before assigning icons (lets UI settle)
     AUTO_ICON_SIMILARITY_THRESHOLD: 0.3, // Min embedding similarity to accept an icon match (exact group name)
     AUTO_ICON_BROAD_THRESHOLD: 0.25, // Lower bar for the broad name+titles vector (longer text dilutes similarity)
+    ENGINE_RUN_TIMEOUT_MS: 60000, // Max wait for one engine acquisition or run. A wedged inference process can leave engine.run()/createEngine() pending forever (no resolve, no reject) — without this the sort hangs forever with no toast. 60s is far above normal inference (seconds) so it only binds when truly wedged.
     AUTO_ICON_MAX_CANDIDATES: 24, // Max Tabler candidates to embedding-rerank per group
     ICON_EMBEDDING_CACHE_LIMIT: 300,
     WARMUP_DELAY_MS: 20000, // Idle delay after init before pre-loading ML engines (lets startup fully settle)
@@ -600,33 +601,77 @@
   const embeddingCache = new Map();
   const EMBEDDING_CACHE_LIMIT = 500;
 
-  // --- ML run serialization + port-death helpers ---
+  // --- ML run serialization + port-death/wedge helpers ---
   // "Port does not exist" (MLEngineParent.sys.mjs) means the inference
   // process / actor died. It happens when two engine.run() calls overlap
   // (warmup vs sort, sort vs auto-icons) or the idle process is reaped.
-  // Serialize every run through a per-engine queue so only one inference
-  // is ever in flight, and retry dead ports after a short backoff so the
-  // process can restart instead of hammering a dead actor.
-  let embeddingRunQueue = Promise.resolve();
-  let namerRunQueue = Promise.resolve();
+  // Worse, a dying port can leave engine.run()/createEngine() pending
+  // FOREVER (no resolve, no reject) — that hung sorts indefinitely with no
+  // toast. So: serialize every run through a per-engine queue so only one
+  // inference is ever in flight, retry dead ports after a short backoff,
+  // and race every engine call against ENGINE_RUN_TIMEOUT_MS (queue resets
+  // on timeout so later calls recover instead of piling behind the wedge).
   const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
   const isDeadPortError = (e) => {
     const msg = String(e?.message ?? e ?? "");
-    return /port does not exist|port closed|message port|actor.*destroy|ns_error|aborted/i.test(
+    // "timed out after" is our own wedge-guard (a run/acquire that never
+    // settles). Treated exactly like a dead port: drop the singleton, back
+    // off, retry. This predicate is only used for engine retry decisions.
+    return /port does not exist|port closed|message port|actor.*destroy|ns_error|aborted|timed out after/i.test(
       msg
     );
   };
-  const enqueueEmbeddingRun = (fn) => {
-    const run = embeddingRunQueue.then(fn, fn);
-    // Keep the queue alive even if this run rejects.
-    embeddingRunQueue = run.catch(() => {});
-    return run;
+  const withEngineTimeout = (promise, ms, label) => {
+    let timer = null;
+    const gate = new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        reject(
+          new Error(`[TidyTabs] Engine call timed out after ${ms}ms (${label})`)
+        );
+      }, ms);
+    });
+    return Promise.race([promise, gate]).then(
+      (v) => {
+        if (timer !== null) clearTimeout(timer);
+        return v;
+      },
+      (e) => {
+        if (timer !== null) clearTimeout(timer);
+        throw e;
+      }
+    );
   };
-  const enqueueNamerRun = (fn) => {
-    const run = namerRunQueue.then(fn, fn);
-    namerRunQueue = run.catch(() => {});
-    return run;
+  const makeSerializedRunner = (label) => {
+    let queue = Promise.resolve();
+    return (fn) => {
+      const run = queue.then(fn, fn);
+      // Keep the queue alive even if this run rejects.
+      queue = run.catch(() => {});
+      let settled = false;
+      run.then(
+        () => {
+          settled = true;
+        },
+        () => {
+          settled = true;
+        }
+      );
+      return withEngineTimeout(run, CONFIG.ENGINE_RUN_TIMEOUT_MS, label).then(
+        (v) => v,
+        (e) => {
+          if (!settled) {
+            console.warn(
+              `[TidyTabs] ${label} run wedged (never settled) — resetting queue so later calls recover`
+            );
+            queue = Promise.resolve();
+          }
+          throw e;
+        }
+      );
+    };
   };
+  const enqueueEmbeddingRun = makeSerializedRunner("embedding");
+  const enqueueNamerRun = makeSerializedRunner("namer");
   // Only drop the singleton if it is still the failed instance — otherwise
   // we'd discard a fresh engine another retry just created (extra
   // re-download + another port race).
@@ -759,13 +804,18 @@
           await getEmbeddingEngine();
           if (warmupCancelled) return;
           // Tiny inference forces model download + session init now,
-          // so the first real sort only pays embedding time.
+          // so the first real sort only pays embedding time. Only mark
+          // ready on a usable vector — a wedged/null warmup must leave
+          // the button grey so the first sort still proves readiness.
+          let warmupVec = null;
           try {
-            await embedTexts(["warmup"]);
+            const [v] = await embedTexts(["warmup"]);
+            warmupVec = v ?? null;
           } catch (_e) {
             /* engine promise reset already handled; sort will retry */
           }
           if (warmupCancelled) return;
+          if (!warmupVec) return;
           // Pre-create topic engine too (no generation run — saves CPU
           // until a new group actually needs naming).
           try {
@@ -872,7 +922,11 @@
   // response can't null out a whole batch.
   const embedTextsSingleAttempt = async (titles) => {
     const known = embeddingEnginePromise;
-    const engine = await getEmbeddingEngine();
+    const engine = await withEngineTimeout(
+      getEmbeddingEngine(),
+      CONFIG.ENGINE_RUN_TIMEOUT_MS,
+      "embedding-engine-ready"
+    );
     try {
       return await enqueueEmbeddingRun(() =>
         engine.run({
@@ -889,7 +943,13 @@
     for (let attempt = 0; attempt < 3; attempt++) {
       const known = embeddingEnginePromise;
       try {
-        const engine = engineHint ?? (await getEmbeddingEngine());
+        const engine =
+          engineHint ??
+          (await withEngineTimeout(
+            getEmbeddingEngine(),
+            CONFIG.ENGINE_RUN_TIMEOUT_MS,
+            "embedding-engine-ready"
+          ));
         const r = await enqueueEmbeddingRun(() =>
           engine.run({
             args: [[title]],
@@ -1500,7 +1560,11 @@
 
             try {
               const knownNamer = namerEnginePromise;
-              const engine = await getNamerEngine();
+              const engine = await withEngineTimeout(
+                getNamerEngine(),
+                CONFIG.ENGINE_RUN_TIMEOUT_MS,
+                "namer-engine-ready"
+              );
 
               let aiResult;
               try {
