@@ -417,6 +417,55 @@
   const embeddingCache = new Map();
   const EMBEDDING_CACHE_LIMIT = 500;
 
+  // --- ML run serialization + port-death helpers ---
+  // "Port does not exist" (MLEngineParent.sys.mjs) means the inference
+  // process / actor died. It happens when two engine.run() calls overlap
+  // (warmup vs sort, sort vs auto-icons) or the idle process is reaped.
+  // Serialize every run through a per-engine queue so only one inference
+  // is ever in flight, and retry dead ports after a short backoff so the
+  // process can restart instead of hammering a dead actor.
+  let embeddingRunQueue = Promise.resolve();
+  let namerRunQueue = Promise.resolve();
+  const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
+  const isDeadPortError = (e) => {
+    const msg = String(e?.message ?? e ?? "");
+    return /port does not exist|port closed|message port|actor.*destroy|ns_error|aborted/i.test(
+      msg
+    );
+  };
+  const enqueueEmbeddingRun = (fn) => {
+    const run = embeddingRunQueue.then(fn, fn);
+    // Keep the queue alive even if this run rejects.
+    embeddingRunQueue = run.catch(() => {});
+    return run;
+  };
+  const enqueueNamerRun = (fn) => {
+    const run = namerRunQueue.then(fn, fn);
+    namerRunQueue = run.catch(() => {});
+    return run;
+  };
+  // Only drop the singleton if it is still the failed instance — otherwise
+  // we'd discard a fresh engine another retry just created (extra
+  // re-download + another port race).
+  const invalidateEmbeddingEngine = (known = null) => {
+    try {
+      if (!known || embeddingEnginePromise === known) {
+        embeddingEnginePromise = null;
+      }
+    } catch (_e) {
+      embeddingEnginePromise = null;
+    }
+  };
+  const invalidateNamerEngine = (known = null) => {
+    try {
+      if (!known || namerEnginePromise === known) {
+        namerEnginePromise = null;
+      }
+    } catch (_e) {
+      namerEnginePromise = null;
+    }
+  };
+
   const getEmbeddingEngine = () => {
     if (!embeddingEnginePromise) {
       embeddingEnginePromise = (async () => {
@@ -498,6 +547,18 @@
         }
         return;
       }
+      // Never race a live sort: concurrent engine.run() calls on the same
+      // engine are the top cause of "Port does not exist". Defer warmup.
+      try {
+        if (typeof isSorting !== "undefined" && isSorting) {
+          if (!warmupCancelled) {
+            try {
+              warmupTimer = setTimeout(kick, 5000);
+            } catch (_e) {}
+          }
+          return;
+        }
+      } catch (_e) {}
       (async () => {
         try {
           await getEmbeddingEngine();
@@ -608,46 +669,79 @@
   // Run true batched inference: one engine.run() for N titles.
   // A dead inference port ("Port does not exist") must drop the singleton
   // so the next call recreates the engine instead of reusing a dead one.
-  const embedTexts = async (titles, _retried = false) => {
-    if (!Array.isArray(titles) || titles.length === 0) return [];
-    let engine = null;
+  // All runs are serialized via embeddingRunQueue; dead-port retries wait
+  // ~800ms so the inference process can restart before the fresh engine
+  // is created. If a batch parses to all-null (engine ignored batching or
+  // returned an unknown shape), fall back to per-title runs so one odd
+  // response can't null out a whole batch.
+  const embedTextsSingleAttempt = async (titles) => {
+    const known = embeddingEnginePromise;
+    const engine = await getEmbeddingEngine();
     try {
-      engine = await getEmbeddingEngine();
+      return await enqueueEmbeddingRun(() =>
+        engine.run({
+          args: [titles],
+          options: { pooling: "mean", normalize: true },
+        })
+      );
     } catch (e) {
-      console.error("[TabSort][AI] Error getting embedding engine:", e);
-      embeddingEnginePromise = null;
-      return new Array(titles.length).fill(null);
+      invalidateEmbeddingEngine(known ?? embeddingEnginePromise);
+      throw e;
     }
-    // Mirror Firefox's own SmartTabGrouping call: pass the texts as a batch
-    // and request mean pooling + normalization. Without "pooling: mean" the
-    // engine returns the raw per-token tensor instead of a single sentence
-    // vector, which this parser can't use (it would silently yield null and
-    // the sort would always "fail" with just an animation).
+  };
+  const embedOneTitleWithRetry = async (title, engineHint = null) => {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const known = embeddingEnginePromise;
+      try {
+        const engine = engineHint ?? (await getEmbeddingEngine());
+        const r = await enqueueEmbeddingRun(() =>
+          engine.run({
+            args: [[title]],
+            options: { pooling: "mean", normalize: true },
+          })
+        );
+        const vec = parseEmbeddingBatch(r, 1)[0] ?? null;
+        if (vec) return vec;
+        // Parsed null without throwing (unknown shape): retry once with a
+        // fresh engine unless this was the last attempt.
+        if (attempt < 2) {
+          invalidateEmbeddingEngine(known);
+          engineHint = null;
+          await sleepMs(400 * (attempt + 1));
+          continue;
+        }
+        return null;
+      } catch (e) {
+        invalidateEmbeddingEngine(known);
+        engineHint = null;
+        if (isDeadPortError(e) && attempt < 2) {
+          await sleepMs(800 * (attempt + 1));
+          continue;
+        }
+        return null;
+      }
+    }
+    return null;
+  };
+  const embedTexts = async (titles, _retried = 0) => {
+    if (!Array.isArray(titles) || titles.length === 0) return [];
+    const known = embeddingEnginePromise;
     try {
-      const result = await engine.run({
-        args: [titles],
-        options: { pooling: "mean", normalize: true },
-      });
+      const result = await embedTextsSingleAttempt(titles);
       const parsed = parseEmbeddingBatch(result, titles.length);
-      // If the engine ignored batching and returned a single vector,
-      // fall back to per-title runs on the SAME engine (no re-creation).
-      if (
-        titles.length > 1 &&
-        parsed.every((v) => v === null) &&
-        Array.isArray(result) &&
-        typeof result[0] === "number"
-      ) {
+      // If the engine ignored batching and returned a single vector or an
+      // unknown shape (all null), fall back to per-title runs on a fresh
+      // read of the engine. This recovers batches that would otherwise
+      // poison clustering into singletons.
+      if (titles.length > 1 && parsed.every((v) => v === null)) {
+        console.warn(
+          "[TabSort][AI] Batch returned no usable vectors, falling back to per-title runs for",
+          titles.length,
+          "titles"
+        );
         const out = [];
         for (const t of titles) {
-          try {
-            const r = await engine.run({
-              args: [[t]],
-              options: { pooling: "mean", normalize: true },
-            });
-            out.push(parseEmbeddingBatch(r, 1)[0] ?? null);
-          } catch {
-            out.push(null);
-          }
+          out.push(await embedOneTitleWithRetry(t));
         }
         return out;
       }
@@ -655,13 +749,15 @@
     } catch (e) {
       console.error("[TabSort][AI] Error in batched embedding:", e);
       // Dead port / crashed inference process: drop the singleton so the
-      // next call creates a fresh engine. Retry once for transient kills.
-      embeddingEnginePromise = null;
-      const msg = String(e?.message ?? e ?? "");
-      if (!_retried && /port does not exist|port closed|message port/i.test(msg)) {
-        console.log("[TabSort][AI] Retrying embedding with a fresh engine...");
+      // next call creates a fresh engine. Retry with backoff for transient kills.
+      invalidateEmbeddingEngine(known);
+      if (isDeadPortError(e) && _retried < 2) {
+        console.log(
+          `[TabSort][AI] Retrying embedding with a fresh engine (attempt ${_retried + 2}/3)...`
+        );
+        await sleepMs(800 * (_retried + 1));
         try {
-          return await embedTexts(titles, true);
+          return await embedTexts(titles, _retried + 1);
         } catch (retryErr) {
           console.error("[TabSort][AI] Embedding retry failed:", retryErr);
         }
@@ -719,6 +815,14 @@
         }
       });
     }
+    try {
+      const nullCount = out.filter((v) => !v).length;
+      if (nullCount > 0) {
+        console.warn(
+          `[TabSort][AI] Embeddings: ${out.length - nullCount}/${out.length} usable (${nullCount} null — engine crash or parse miss, will cluster on usable subset)`
+        );
+      }
+    } catch (_e) {}
     return out;
   };
 
@@ -965,11 +1069,11 @@
 
           // Group naming function (shared singleton engine).
           // "Group" results come from three places, all handled below:
-          // 1) dead inference port -> engine.run throws -> retry once with a
-          //    fresh engine (previously every later group stayed "Group");
+          // 1) dead inference port -> engine.run throws -> retry with backoff
+          //    + fresh engine (previously every later group stayed "Group");
           // 2) model returns empty/generic ("Group") -> title fallback;
           // 3) title fallback itself empty -> "Group" (last resort only).
-          async function nameGroupWithSmartTabTopic(titles, _retried = false) {
+          async function nameGroupWithSmartTabTopic(titles, _retried = 0) {
             // Plain titles only: this matches the input shape Mozilla's
             // smart-tab-topic was trained on (Firefox passes concatenated
             // titles). The old "Topic from keywords:" prefix confused the
@@ -987,12 +1091,21 @@
             };
 
             try {
+              const knownNamer = namerEnginePromise;
               const engine = await getNamerEngine();
 
-              const aiResult = await engine.run({
-                args: [input],
-                options: { max_new_tokens: 8, temperature: 0.7 },
-              });
+              let aiResult;
+              try {
+                aiResult = await enqueueNamerRun(() =>
+                  engine.run({
+                    args: [input],
+                    options: { max_new_tokens: 8, temperature: 0.7 },
+                  })
+                );
+              } catch (runErr) {
+                invalidateNamerEngine(knownNamer);
+                throw runErr;
+              }
 
               const raw = aiResult?.[0]?.generated_text;
               let name = String(raw || "")
@@ -1021,13 +1134,15 @@
             } catch (e) {
               console.error("[TabSort][AI] Error naming group:", e);
               // Dead port / crashed inference process: drop the singleton
-              // and retry once, mirroring embedTexts.
-              namerEnginePromise = null;
-              const msg = String(e?.message ?? e ?? "");
-              if (!_retried && /port does not exist|port closed|message port/i.test(msg)) {
-                console.log("[TabSort][AI] Retrying group naming with a fresh engine...");
+              // and retry with backoff, mirroring embedTexts.
+              invalidateNamerEngine();
+              if (isDeadPortError(e) && _retried < 2) {
+                console.log(
+                  `[TabSort][AI] Retrying group naming with a fresh engine (attempt ${_retried + 2}/3)...`
+                );
+                await sleepMs(800 * (_retried + 1));
                 try {
-                  return await nameGroupWithSmartTabTopic(titles, true);
+                  return await nameGroupWithSmartTabTopic(titles, _retried + 1);
                 } catch (retryErr) {
                   console.error("[TabSort][AI] Naming retry failed:", retryErr);
                 }
@@ -1752,6 +1867,11 @@
   const sortTabsByTopic = async () => {
     if (isSorting) return;
     isSorting = true;
+    // Stop idle warmup inference so it can't run concurrently with the
+    // sort on the same ML engine (dead-port crashes).
+    try {
+      cancelWarmup();
+    } catch (_e) {}
 
     let separatorsToSort = [];
     try {
