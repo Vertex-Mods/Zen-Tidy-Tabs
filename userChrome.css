@@ -155,6 +155,15 @@
       & .broom-icon {
         opacity: 0.5;
       }
+
+      /* Persistently shown in this mode, so grey out here too. */
+      &.warming-up {
+        cursor: wait !important;
+
+        & .broom-icon {
+          opacity: 0.25 !important;
+        }
+      }
     }
 
     :root:not([zen-sidebar-expanded="true"]) & {
@@ -168,6 +177,9 @@
       margin: 0 !important;
       padding: 0 !important;
     }
+
+    /* Warming-up dimming is hover-scoped below: idle the button is just
+       a 1px divider bar (icon hidden), so it must not grey out there. */
   }
 
   &:hover {
@@ -187,6 +199,18 @@
 
     & #sort-button:hover .broom-icon {
       opacity: 1 !important;
+    }
+
+    /* Warming-up: only grey out when the button is actually shown as a
+       button (separator hovered or sidebar implicit-hover). Idle it is a
+       1px divider bar and must render normally. Stays clickable so the
+       command handler can toast. */
+    & #sort-button.warming-up:hover .broom-icon {
+      opacity: 0.25 !important;
+    }
+
+    & #sort-button.warming-up:hover {
+      cursor: wait !important;
     }
   }
 
