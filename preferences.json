@@ -21,6 +21,27 @@
   },
   {
     "type": "separator",
+    "label": "Auto-sort"
+  },
+  {
+    "property": "zen.tidy-tabs.auto-sort-new-tabs",
+    "label": "Automatically sort new tabs into existing groups",
+    "type": "checkbox",
+    "defaultValue": false,
+    "description": "When a new tab finishes loading, the local AI moves it into the group in its space that clearly fits best. Tabs you drag out are never moved again."
+  },
+  {
+    "property": "zen.tidy-tabs.auto-sort-create-groups",
+    "label": "Create a new group when no group fits",
+    "type": "checkbox",
+    "defaultValue": false,
+    "description": "Off: tabs that match no group stay ungrouped. On: the AI makes a new named group for them.",
+    "conditions": [
+      { "if": { "property": "zen.tidy-tabs.auto-sort-new-tabs", "value": true } }
+    ]
+  },
+  {
+    "type": "separator",
     "label": "Group icons"
   },
   {

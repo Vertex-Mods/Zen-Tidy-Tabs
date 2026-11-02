@@ -28,6 +28,18 @@
     WORKSPACE_SUGGEST_MARGIN: 0.12, // Must beat current-workspace similarity by this much
     WORKSPACE_SUGGEST_MAX: 3, // Max suggestion rows per notification (avoids clutter)
     WORKSPACE_PROFILE_CACHE_LIMIT: 20,
+    // --- Auto-sort new tabs (opt-in) ---
+    AUTO_SORT_DEBOUNCE_MS: 1500, // Tabs that finish loading within this window share one embedding run
+    AUTO_SORT_PENDING_TTL_MS: 60000, // Forget a new tab that hasn't loaded a real page by then
+    AUTO_SORT_RETRY_MS: 2000, // Re-check interval while the broom sort is running
+    AUTO_SORT_MAX_BUSY_RETRIES: 10, // Then drop that batch instead of waiting forever
+    AUTO_SORT_BROOM_WAIT_MS: 15000, // Max time a broom click waits for an in-flight batch
+    AUTO_SORT_ARM_FALLBACK_MS: 10000, // Arm delay when SessionStore's restore promise is unavailable
+    // A single new tab rarely clears GROUP_SIMILARITY_THRESHOLD against a mixed
+    // group, so auto-sort also accepts a clear winner: best score at least
+    // MIN_SIMILARITY and ahead of the runner-up group by MIN_MARGIN.
+    AUTO_SORT_MIN_SIMILARITY: 0.1,
+    AUTO_SORT_MIN_MARGIN: 0.1,
   };
 
   // --- Ensure Firefox's local ML engine is enabled ---
@@ -48,6 +60,8 @@
   const AUTO_ICON_KEYWORDS_PREF = "zen.tidy-tabs.auto-icons-keywords";
   const WORKSPACE_SUGGEST_PREF = "zen.tidy-tabs.workspace-suggest";
   const WORKSPACE_NAME_ONLY_PREF = "zen.tidy-tabs.workspace-name-only";
+  const AUTO_SORT_PREF = "zen.tidy-tabs.auto-sort-new-tabs";
+  const AUTO_SORT_CREATE_GROUPS_PREF = "zen.tidy-tabs.auto-sort-create-groups";
 
   // User-configurable minimum tab count for the sort button to appear.
   // The user can type any amount (including less than 6) in the mod settings.
@@ -145,6 +159,36 @@
     }
   };
 
+  // Auto-sort toggles. Both opt-in (default false); read on every step so
+  // switching them off takes effect immediately.
+  const getAutoSortEnabled = () => {
+    try {
+      if (typeof Services === "undefined" || !Services.prefs) return false;
+      try {
+        return Services.prefs.getBoolPref(AUTO_SORT_PREF, false);
+      } catch (_e) {
+        return false;
+      }
+    } catch (e) {
+      console.error("[TabSort] Error reading auto-sort pref:", e);
+      return false;
+    }
+  };
+
+  const getAutoSortCreateGroupsEnabled = () => {
+    try {
+      if (typeof Services === "undefined" || !Services.prefs) return false;
+      try {
+        return Services.prefs.getBoolPref(AUTO_SORT_CREATE_GROUPS_PREF, false);
+      } catch (_e) {
+        return false;
+      }
+    } catch (e) {
+      console.error("[TabSort] Error reading auto-sort create-groups pref:", e);
+      return false;
+    }
+  };
+
   const getTabIconURL = (tab) => {
     try {
       if (!tab?.isConnected) return "";
@@ -175,6 +219,8 @@
   let sortAnimationId = null;
   let eventListenersAdded = false;
   let minTabsPrefObserver = null;
+  // In-flight auto-sort batch; the broom sort awaits it so clicks are never dropped.
+  let autoSortPromise = null;
 
   // DOM Cache for performance
   const domCache = {
@@ -906,28 +952,21 @@
     }
   };
 
-  const askAIForMultipleTopics = async (tabs) => {
-    if (!Array.isArray(tabs) || tabs.length === 0) return [];
+  // --- Existing-group matching (shared by the broom sort and auto-sort) ---
+  // Both paths must use exactly the same strictness, so the logic lives here.
 
-    const validTabs = tabs.filter((tab) => tab?.isConnected);
-    if (!validTabs.length) return [];
-
-    const currentWorkspaceId = window.gZenWorkspaces?.activeWorkspace;
-    const result = [];
-    const ungroupedTabs = [];
-    // Reuse first-pass vectors for the clustering pass below — no re-inference.
-    const ungroupedEmbeddingsReuse = [];
-
-    // Get existing groups in current workspace
+  // Existing groups that hold tabs of a workspace, keyed by label:
+  // { element, tabs, tabTitles }.
+  const collectWorkspaceGroups = (workspaceId) => {
     const existingWorkspaceGroups = new Map();
-    if (currentWorkspaceId) {
-      const groupSelector = `tab-group:has(tab[zen-workspace-id="${currentWorkspaceId}"])`;
+    if (workspaceId) {
+      const groupSelector = `tab-group:has(tab[zen-workspace-id="${workspaceId}"])`;
       document.querySelectorAll(groupSelector).forEach((groupEl) => {
         const label = groupEl.getAttribute("label");
         if (label) {
           // Get tabs in this group to calculate group embedding
           const groupTabs = Array.from(groupEl.querySelectorAll('tab')).filter(tab => 
-            tab.getAttribute("zen-workspace-id") === currentWorkspaceId
+            tab.getAttribute("zen-workspace-id") === workspaceId
           );
           if (groupTabs.length > 0) {
             existingWorkspaceGroups.set(label, {
@@ -939,13 +978,12 @@
         }
       });
     }
+    return existingWorkspaceGroups;
+  };
 
-    // Batched inference with cache (single shared engine, no re-creation).
-    const tabTitles = validTabs.map((tab) => getTabTitle(tab));
-    const embeddings = await getEmbeddingsForTitles(tabTitles);
-
-    // Calculate embeddings for existing workspace groups (cache-hit when
-    // titles overlap with open tabs).
+  // Average title embedding per group (cache-hit when titles overlap with
+  // open tabs). Returns Map<label, vector>.
+  const embedWorkspaceGroups = async (existingWorkspaceGroups) => {
     const existingGroupEmbeddings = new Map();
     for (const [groupName, groupInfo] of existingWorkspaceGroups) {
       try {
@@ -963,6 +1001,217 @@
         console.error(`[TabSort] Error calculating embedding for existing group "${groupName}":`, e);
       }
     }
+    return existingGroupEmbeddings;
+  };
+
+  // Best existing group for one tab, or null. Embedding cosine + boost
+  // first, then a levenshtein title fallback. Tabs without an embedding
+  // never match (same as the original broom sort).
+  const findBestExistingGroup = (
+    tabTitle,
+    tabEmbedding,
+    existingWorkspaceGroups,
+    existingGroupEmbeddings
+  ) => {
+    if (!tabEmbedding) return null;
+
+    let bestMatch = null;
+    let bestSimilarity = 0;
+
+    // Check against current workspace groups
+    for (const [groupName, groupInfo] of existingWorkspaceGroups) {
+      const groupEmbedding = existingGroupEmbeddings.get(groupName);
+      if (!groupEmbedding) continue;
+
+      let similarity = cosineSimilarity(tabEmbedding, groupEmbedding);
+      similarity += CONFIG.EXISTING_GROUP_BOOST; // Always boost existing groups
+
+      if (similarity > CONFIG.GROUP_SIMILARITY_THRESHOLD && similarity > bestSimilarity) {
+        bestMatch = { 
+          groupName, 
+          similarity,
+          matchType: 'embedding'
+        };
+        bestSimilarity = similarity;
+      }
+    }
+
+    // Additional semantic matching for existing groups using title similarity
+    if (!bestMatch || bestMatch.similarity < 0.8) {
+      for (const [groupName, groupInfo] of existingWorkspaceGroups) {
+        // Check if tab title has semantic similarity to group tabs
+        const titleSimilarities = groupInfo.tabTitles.map(groupTabTitle => {
+          const distance = levenshteinDistance(tabTitle.toLowerCase(), groupTabTitle.toLowerCase());
+          const maxLen = Math.max(tabTitle.length, groupTabTitle.length);
+          return maxLen > 0 ? 1 - (distance / maxLen) : 0;
+        });
+
+        const maxTitleSimilarity = Math.max(...titleSimilarities);
+        
+        // If we find strong title similarity, consider it a match
+        if (maxTitleSimilarity > 0.7) {
+          const adjustedSimilarity = maxTitleSimilarity * 0.8 + CONFIG.EXISTING_GROUP_BOOST;
+          if (adjustedSimilarity > CONFIG.GROUP_SIMILARITY_THRESHOLD && adjustedSimilarity > bestSimilarity) {
+            bestMatch = { 
+              groupName, 
+              similarity: adjustedSimilarity,
+              matchType: 'title'
+            };
+            bestSimilarity = adjustedSimilarity;
+          }
+        }
+      }
+    }
+
+    return bestMatch;
+  };
+
+  // Auto-sort only: the broom match first, then a looser "clear winner" rule
+  // on the same average group vectors (closest-tab scoring was tried and let
+  // unrelated tabs in through one loosely similar title).
+  const findAutoSortGroup = (
+    tabTitle,
+    tabEmbedding,
+    existingWorkspaceGroups,
+    existingGroupEmbeddings
+  ) => {
+    const strict = findBestExistingGroup(
+      tabTitle,
+      tabEmbedding,
+      existingWorkspaceGroups,
+      existingGroupEmbeddings
+    );
+    if (strict || !tabEmbedding) return strict;
+
+    const scores = [];
+    for (const groupName of existingWorkspaceGroups.keys()) {
+      const avg = existingGroupEmbeddings.get(groupName);
+      if (avg) scores.push({ groupName, score: cosineSimilarity(tabEmbedding, avg) });
+    }
+    scores.sort((a, b) => b.score - a.score);
+    const [best, second] = scores;
+    if (!best) return null;
+    const margin = best.score - (second ? Math.max(second.score, 0) : 0);
+    console.log(
+      `[TabSort][Auto] "${tabTitle}" best "${best.groupName}" ${best.score.toFixed(3)}, margin ${margin.toFixed(3)}`
+    );
+    if (
+      best.score >= CONFIG.AUTO_SORT_MIN_SIMILARITY &&
+      margin >= CONFIG.AUTO_SORT_MIN_MARGIN
+    ) {
+      return { groupName: best.groupName, similarity: best.score, matchType: "auto" };
+    }
+    return null;
+  };
+
+  // Group naming function (shared singleton engine).
+  // "Group" results come from three places, all handled below:
+  // 1) dead inference port -> engine.run throws -> retry with backoff
+  //    + fresh engine (previously every later group stayed "Group");
+  // 2) model returns empty/generic ("Group") -> title fallback;
+  // 3) title fallback itself empty -> "Group" (last resort only).
+  async function nameGroupWithSmartTabTopic(titles, _retried = 0) {
+    // Plain titles only: this matches the input shape Mozilla's
+    // smart-tab-topic was trained on (Firefox passes concatenated
+    // titles). The old "Topic from keywords:" prefix confused the
+    // small model into generic outputs.
+    const input = (titles || []).join("\n").slice(0, 1000);
+
+    const titleFallback = () => {
+      const fb = String(titles?.[0] || "")
+        .split("–")[0]
+        .trim()
+        .slice(0, 24)
+        .replace(/^['"`]+|['"`]+$/g, "")
+        .replace(/[.?!,:;]+$/, "");
+      return fb || "Group";
+    };
+
+    try {
+      const knownNamer = namerEnginePromise;
+      const engine = await getNamerEngine();
+
+      let aiResult;
+      try {
+        aiResult = await enqueueNamerRun(() =>
+          engine.run({
+            args: [input],
+            options: { max_new_tokens: 8, temperature: 0.7 },
+          })
+        );
+      } catch (runErr) {
+        invalidateNamerEngine(knownNamer);
+        throw runErr;
+      }
+
+      const raw = aiResult?.[0]?.generated_text;
+      let name = String(raw || "")
+        .split("\n")
+        .map((l) => l.trim())
+        .find((l) => l);
+
+      console.log(
+        `[TabSort][AI] Topic model raw output for [${(titles || []).slice(0, 3).join(" | ")}]:`,
+        JSON.stringify(raw ?? null)
+      );
+
+      name = toTitleCase(name);
+      if (!name || /^(group|untitled|new tab)?$|none|adult content/i.test(name)) {
+        console.log(
+          `[TabSort][AI] Topic model gave unusable name (${JSON.stringify(name)}), using title fallback`
+        );
+        return titleFallback();
+      }
+
+      name = name
+        .replace(/^['"`]+|['"`]+$/g, "")
+        .replace(/[.?!,:;]+$/, "")
+        .slice(0, 24);
+      return name || titleFallback();
+    } catch (e) {
+      console.error("[TabSort][AI] Error naming group:", e);
+      // Dead port / crashed inference process: drop the singleton
+      // and retry with backoff, mirroring embedTexts.
+      invalidateNamerEngine();
+      if (isDeadPortError(e) && _retried < 2) {
+        console.log(
+          `[TabSort][AI] Retrying group naming with a fresh engine (attempt ${_retried + 2}/3)...`
+        );
+        await sleepMs(800 * (_retried + 1));
+        try {
+          return await nameGroupWithSmartTabTopic(titles, _retried + 1);
+        } catch (retryErr) {
+          console.error("[TabSort][AI] Naming retry failed:", retryErr);
+        }
+      }
+      return titleFallback();
+    }
+  }
+
+  const askAIForMultipleTopics = async (tabs) => {
+    if (!Array.isArray(tabs) || tabs.length === 0) return [];
+
+    const validTabs = tabs.filter((tab) => tab?.isConnected);
+    if (!validTabs.length) return [];
+
+    const currentWorkspaceId = window.gZenWorkspaces?.activeWorkspace;
+    const result = [];
+    const ungroupedTabs = [];
+    // Reuse first-pass vectors for the clustering pass below — no re-inference.
+    const ungroupedEmbeddingsReuse = [];
+
+    // Get existing groups in current workspace
+    const existingWorkspaceGroups = collectWorkspaceGroups(currentWorkspaceId);
+
+    // Batched inference with cache (single shared engine, no re-creation).
+    const tabTitles = validTabs.map((tab) => getTabTitle(tab));
+    const embeddings = await getEmbeddingsForTitles(tabTitles);
+
+    // Calculate embeddings for existing workspace groups (cache-hit when
+    // titles overlap with open tabs).
+    const existingGroupEmbeddings = await embedWorkspaceGroups(
+      existingWorkspaceGroups
+    );
 
     // Enhanced matching: try to match tabs to existing groups
     for (let i = 0; i < validTabs.length; i++) {
@@ -976,59 +1225,17 @@
         continue;
       }
 
-      let bestMatch = null;
-      let bestSimilarity = 0;
-
-      // Check against current workspace groups
-      for (const [groupName, groupInfo] of existingWorkspaceGroups) {
-        const groupEmbedding = existingGroupEmbeddings.get(groupName);
-        if (!groupEmbedding) continue;
-
-        let similarity = cosineSimilarity(tabEmbedding, groupEmbedding);
-        similarity += CONFIG.EXISTING_GROUP_BOOST; // Always boost existing groups
-
-        if (similarity > CONFIG.GROUP_SIMILARITY_THRESHOLD && similarity > bestSimilarity) {
-          bestMatch = { 
-            groupData: { groupName }, 
-            similarity,
-            isExistingGroup: true
-          };
-          bestSimilarity = similarity;
-        }
-      }
-
-      // Additional semantic matching for existing groups using title similarity
-      if (!bestMatch || bestMatch.similarity < 0.8) {
-        for (const [groupName, groupInfo] of existingWorkspaceGroups) {
-          // Check if tab title has semantic similarity to group tabs
-          const titleSimilarities = groupInfo.tabTitles.map(groupTabTitle => {
-            const distance = levenshteinDistance(tabTitle.toLowerCase(), groupTabTitle.toLowerCase());
-            const maxLen = Math.max(tabTitle.length, groupTabTitle.length);
-            return maxLen > 0 ? 1 - (distance / maxLen) : 0;
-          });
-
-          const maxTitleSimilarity = Math.max(...titleSimilarities);
-          
-          // If we find strong title similarity, consider it a match
-          if (maxTitleSimilarity > 0.7) {
-            const adjustedSimilarity = maxTitleSimilarity * 0.8 + CONFIG.EXISTING_GROUP_BOOST;
-            if (adjustedSimilarity > CONFIG.GROUP_SIMILARITY_THRESHOLD && adjustedSimilarity > bestSimilarity) {
-              bestMatch = { 
-                groupData: { groupName }, 
-                similarity: adjustedSimilarity,
-                isExistingGroup: true,
-                matchType: 'title'
-              };
-              bestSimilarity = adjustedSimilarity;
-            }
-          }
-        }
-      }
+      const bestMatch = findBestExistingGroup(
+        tabTitle,
+        tabEmbedding,
+        existingWorkspaceGroups,
+        existingGroupEmbeddings
+      );
 
       if (bestMatch) {
         // Add tab to existing group
-        result.push({ tab, topic: bestMatch.groupData.groupName });
-        console.log(`[TabSort] Matched "${tabTitle}" to existing group "${bestMatch.groupData.groupName}" (similarity: ${bestMatch.similarity.toFixed(3)}, type: ${bestMatch.matchType || 'embedding'})`);
+        result.push({ tab, topic: bestMatch.groupName });
+        console.log(`[TabSort] Matched "${tabTitle}" to existing group "${bestMatch.groupName}" (similarity: ${bestMatch.similarity.toFixed(3)}, type: ${bestMatch.matchType || 'embedding'})`);
       } else {
         ungroupedTabs.push(tab);
         ungroupedEmbeddingsReuse.push(tabEmbedding);
@@ -1123,90 +1330,6 @@
               .map(([word]) => word);
 
             return keywords;
-          }
-
-          // Group naming function (shared singleton engine).
-          // "Group" results come from three places, all handled below:
-          // 1) dead inference port -> engine.run throws -> retry with backoff
-          //    + fresh engine (previously every later group stayed "Group");
-          // 2) model returns empty/generic ("Group") -> title fallback;
-          // 3) title fallback itself empty -> "Group" (last resort only).
-          async function nameGroupWithSmartTabTopic(titles, _retried = 0) {
-            // Plain titles only: this matches the input shape Mozilla's
-            // smart-tab-topic was trained on (Firefox passes concatenated
-            // titles). The old "Topic from keywords:" prefix confused the
-            // small model into generic outputs.
-            const input = (titles || []).join("\n").slice(0, 1000);
-
-            const titleFallback = () => {
-              const fb = String(titles?.[0] || "")
-                .split("–")[0]
-                .trim()
-                .slice(0, 24)
-                .replace(/^['"`]+|['"`]+$/g, "")
-                .replace(/[.?!,:;]+$/, "");
-              return fb || "Group";
-            };
-
-            try {
-              const knownNamer = namerEnginePromise;
-              const engine = await getNamerEngine();
-
-              let aiResult;
-              try {
-                aiResult = await enqueueNamerRun(() =>
-                  engine.run({
-                    args: [input],
-                    options: { max_new_tokens: 8, temperature: 0.7 },
-                  })
-                );
-              } catch (runErr) {
-                invalidateNamerEngine(knownNamer);
-                throw runErr;
-              }
-
-              const raw = aiResult?.[0]?.generated_text;
-              let name = String(raw || "")
-                .split("\n")
-                .map((l) => l.trim())
-                .find((l) => l);
-
-              console.log(
-                `[TabSort][AI] Topic model raw output for [${(titles || []).slice(0, 3).join(" | ")}]:`,
-                JSON.stringify(raw ?? null)
-              );
-
-              name = toTitleCase(name);
-              if (!name || /^(group|untitled|new tab)?$|none|adult content/i.test(name)) {
-                console.log(
-                  `[TabSort][AI] Topic model gave unusable name (${JSON.stringify(name)}), using title fallback`
-                );
-                return titleFallback();
-              }
-
-              name = name
-                .replace(/^['"`]+|['"`]+$/g, "")
-                .replace(/[.?!,:;]+$/, "")
-                .slice(0, 24);
-              return name || titleFallback();
-            } catch (e) {
-              console.error("[TabSort][AI] Error naming group:", e);
-              // Dead port / crashed inference process: drop the singleton
-              // and retry with backoff, mirroring embedTexts.
-              invalidateNamerEngine();
-              if (isDeadPortError(e) && _retried < 2) {
-                console.log(
-                  `[TabSort][AI] Retrying group naming with a fresh engine (attempt ${_retried + 2}/3)...`
-                );
-                await sleepMs(800 * (_retried + 1));
-                try {
-                  return await nameGroupWithSmartTabTopic(titles, _retried + 1);
-                } catch (retryErr) {
-                  console.error("[TabSort][AI] Naming retry failed:", retryErr);
-                }
-              }
-              return titleFallback();
-            }
           }
 
           // Process each new group
@@ -2426,6 +2549,17 @@
 
   // --- Main Sorting Function ---
   const sortTabsByTopic = async () => {
+    // Let an in-flight auto-sort batch finish first, so a click is never
+    // silently ignored and both never move the same tabs at once.
+    // Bounded, so a hung batch can't block the broom forever.
+    if (autoSortPromise) {
+      try {
+        await Promise.race([
+          autoSortPromise,
+          sleepMs(CONFIG.AUTO_SORT_BROOM_WAIT_MS),
+        ]);
+      } catch (_e) {}
+    }
     if (isSorting) return;
     isSorting = true;
     // Stop idle warmup inference so it can't run concurrently with the
@@ -3469,6 +3603,446 @@
     ]);
   };
 
+  // --- Auto-sort new tabs (opt-in, zen.tidy-tabs.auto-sort-new-tabs) ---
+  // Each tab opened after session restore is sorted once, when its first
+  // real page has loaded. Ready tabs are batched into one embedding run
+  // and matched with the same helpers (and strictness) as the broom sort.
+  // tab -> time it started loading a real URL (null while still about:*).
+  // WeakMap so closed tabs never leak.
+  let autoSortPending = new WeakMap();
+  const autoSortReady = new Set(); // loaded tabs waiting for the next batch
+  const autoSortHandled = new WeakSet(); // once only: dragged-out tabs stay put
+  const autoSortRetried = new WeakSet(); // transient failures get one retry
+  let autoSortListeners = []; // [target, eventName, handler]
+  let autoSortTimer = null;
+  let autoSortArmTimer = null;
+  let autoSortBusyRetries = 0;
+  let autoSortGeneration = 0; // bumped on teardown: late arms / in-flight batches bail
+  // Sine re-runs the script on rebuild; the previous copy's teardown lives
+  // here so its listeners don't double-sort.
+  const AUTO_SORT_TEARDOWN_KEY = Symbol.for("zen-tidy-tabs.auto-sort.teardown");
+
+  const UNREADY_TITLES = new Set([
+    "Untitled Page",
+    "Invalid Tab",
+    "Error Processing Tab",
+  ]);
+
+  const getTabURLSpec = (tab) => {
+    try {
+      return tab?.linkedBrowser?.currentURI?.spec || "";
+    } catch (_e) {
+      return "";
+    }
+  };
+
+  // Loaded = not busy, real title, real (non-about:) URL.
+  const isTabReadyForAutoSort = (tab) => {
+    try {
+      if (!tab?.isConnected || tab.hasAttribute("busy")) return false;
+      const spec = getTabURLSpec(tab);
+      if (!spec || spec.startsWith("about:")) return false;
+      return !UNREADY_TITLES.has(getTabTitle(tab));
+    } catch (_e) {
+      return false;
+    }
+  };
+
+  // "skip": never auto-sort (incl. already grouped: the drag-out guarantee).
+  // "wait": transient state, worth one retry. "ok": sortable now.
+  const getAutoSortTabState = (tab) => {
+    if (
+      !tab?.isConnected ||
+      tab.closing ||
+      tab.pinned ||
+      tab.hasAttribute("zen-essential") ||
+      tab.closest("tab-group") // e.g. opened from a grouped tab: Firefox grouped it
+    ) {
+      return "skip";
+    }
+    if (
+      tab.hasAttribute("zen-glance-tab") ||
+      tab.hasAttribute("zen-empty-tab") ||
+      !tab.getAttribute("zen-workspace-id")
+    ) {
+      return "wait";
+    }
+    return "ok";
+  };
+  const isAutoSortCandidate = (tab) => getAutoSortTabState(tab) === "ok";
+
+  const scheduleAutoSortBatch = (delay = CONFIG.AUTO_SORT_DEBOUNCE_MS) => {
+    if (autoSortTimer != null) clearTimeout(autoSortTimer);
+    autoSortTimer = setTimeout(runAutoSortBatch, delay);
+  };
+
+  const onAutoSortTabOpen = (event) => {
+    try {
+      if (!getAutoSortEnabled()) return;
+      const tab = event.target;
+      if (!tab || autoSortHandled.has(tab)) return;
+      autoSortPending.set(tab, null);
+    } catch (e) {
+      console.error("[TabSort][Auto] TabOpen handler failed:", e);
+    }
+  };
+
+  const onAutoSortTabAttrModified = (event) => {
+    try {
+      const tab = event.target;
+      if (!autoSortPending.has(tab)) return;
+      if (!getAutoSortEnabled()) {
+        autoSortPending.delete(tab);
+        return;
+      }
+      // Blank/newtab placeholder waiting for the user to type: no TTL yet.
+      const spec = getTabURLSpec(tab);
+      if (!spec || spec.startsWith("about:")) return;
+      let loadStartedAt = autoSortPending.get(tab);
+      if (loadStartedAt == null) {
+        loadStartedAt = Date.now();
+        autoSortPending.set(tab, loadStartedAt);
+      }
+      if (Date.now() - loadStartedAt > CONFIG.AUTO_SORT_PENDING_TTL_MS) {
+        autoSortPending.delete(tab);
+        return;
+      }
+      if (!isTabReadyForAutoSort(tab)) return;
+      autoSortPending.delete(tab);
+      autoSortReady.add(tab);
+      scheduleAutoSortBatch();
+    } catch (e) {
+      console.error("[TabSort][Auto] TabAttrModified handler failed:", e);
+    }
+  };
+
+  // Undo-close / session restore: not a new tab, never auto-sort it.
+  const onAutoSortTabRestoring = (event) => {
+    autoSortPending.delete(event.target);
+    autoSortReady.delete(event.target);
+  };
+
+  const onAutoSortTabClose = (event) => {
+    autoSortPending.delete(event.target);
+    autoSortReady.delete(event.target);
+  };
+
+  const showAutoSortToast = (moved, created) => {
+    const createdTabs = created.reduce((n, g) => n + g.count, 0);
+    if (moved.length === 0 && created.length === 0) return;
+    if (created.length === 0 && moved.length === 1) {
+      showTidyToast(`Moved to “${moved[0]}”`, "info");
+    } else if (moved.length === 0 && created.length === 1) {
+      showTidyToast(`New group “${created[0].label}”`, "info");
+    } else {
+      showTidyToast(`Sorted ${moved.length + createdTabs} new tabs`, "info");
+    }
+  };
+
+  // Sorts one batch of ready tabs. Never expands collapsed groups.
+  const autoSortTabs = async (tabs) => {
+    const generation = autoSortGeneration;
+    // Teardown (Sine re-run / unload), pref off, or broom sort running.
+    const shouldStop = () =>
+      generation !== autoSortGeneration || !getAutoSortEnabled() || isSorting;
+    const retryTabs = []; // transient failures (no embedding, state not settled)
+    const moved = []; // group label per moved tab
+    const created = []; // { label, count }
+
+    const moveToGroup = (tab, groupEl, label, detail = "") => {
+      try {
+        const wasCollapsed = groupEl.collapsed;
+        gBrowser.moveTabToExistingGroup(tab, groupEl);
+        // Adding a tab expands the group; put it back as the user left it.
+        if (wasCollapsed && !groupEl.collapsed) groupEl.collapsed = true;
+        moved.push(label);
+        console.log(`[TabSort][Auto] Moved "${getTabTitle(tab)}" to "${label}"${detail}`);
+      } catch (e) {
+        console.error(`[TabSort][Auto] Failed to move tab to "${label}":`, e);
+      }
+    };
+
+    try {
+      const byWorkspace = new Map();
+      for (const tab of tabs) {
+        if (autoSortHandled.has(tab)) continue;
+        const state = getAutoSortTabState(tab);
+        if (state === "skip") {
+          autoSortHandled.add(tab);
+          continue;
+        }
+        if (state === "wait") {
+          retryTabs.push(tab);
+          continue;
+        }
+        const wsId = tab.getAttribute("zen-workspace-id");
+        if (!byWorkspace.has(wsId)) byWorkspace.set(wsId, []);
+        byWorkspace.get(wsId).push(tab);
+      }
+
+      for (const [wsId, wsTabs] of byWorkspace) {
+        if (shouldStop()) break;
+        const existingGroups = collectWorkspaceGroups(wsId);
+        // Nothing to match against and not allowed to create: skip inference.
+        if (existingGroups.size === 0 && !getAutoSortCreateGroupsEnabled()) {
+          wsTabs.forEach((tab) => autoSortHandled.add(tab));
+          console.log(
+            `[TabSort][Auto] No groups in workspace ${wsId}, leaving ${wsTabs.length} tab(s) ungrouped`
+          );
+          continue;
+        }
+
+        const titles = wsTabs.map((tab) => getTabTitle(tab));
+        const embeddings = await getEmbeddingsForTitles(titles);
+        if (generation !== autoSortGeneration) return;
+        // Once a tab has an embedding it has had its one shot.
+        wsTabs.forEach((tab, i) => {
+          if (embeddings[i]) autoSortHandled.add(tab);
+          else retryTabs.push(tab);
+        });
+        const groupEmbeddings = await embedWorkspaceGroups(existingGroups);
+        if (shouldStop()) break;
+
+        const unmatchedTabs = [];
+        const unmatchedEmbeddings = [];
+        for (let i = 0; i < wsTabs.length; i++) {
+          const tab = wsTabs[i];
+          if (!embeddings[i]) continue;
+          // State may have changed during inference (closed, grouped, pinned...).
+          if (!isAutoSortCandidate(tab)) continue;
+          const match = findAutoSortGroup(
+            titles[i],
+            embeddings[i],
+            existingGroups,
+            groupEmbeddings
+          );
+          const groupEl = match ? existingGroups.get(match.groupName)?.element : null;
+          if (groupEl?.isConnected) {
+            moveToGroup(
+              tab,
+              groupEl,
+              match.groupName,
+              ` (similarity: ${match.similarity.toFixed(3)}, type: ${match.matchType})`
+            );
+            continue;
+          }
+          unmatchedTabs.push(tab);
+          unmatchedEmbeddings.push(embeddings[i]);
+        }
+
+        if (unmatchedTabs.length === 0) continue;
+        if (!getAutoSortCreateGroupsEnabled()) {
+          console.log(
+            `[TabSort][Auto] ${unmatchedTabs.length} tab(s) match no group, leaving them ungrouped`
+          );
+          continue;
+        }
+
+        // Unlike the broom sort, single-tab clusters also get a group here.
+        const clusters = clusterEmbeddings(
+          unmatchedEmbeddings,
+          CONFIG.SIMILARITY_THRESHOLD
+        );
+        for (const cluster of clusters) {
+          if (shouldStop() || !getAutoSortCreateGroupsEnabled()) break;
+          const clusterTabs = cluster
+            .map((idx) => unmatchedTabs[idx])
+            .filter(isAutoSortCandidate);
+          if (clusterTabs.length === 0) continue;
+          const clusterTitles = clusterTabs.map((tab) => getTabTitle(tab));
+          const label = await nameGroupWithSmartTabTopic(clusterTitles);
+          // Naming is async: re-validate before touching the DOM.
+          if (shouldStop()) break;
+          const groupTabs = clusterTabs.filter(isAutoSortCandidate);
+          if (groupTabs.length === 0) continue;
+
+          // Name already taken in this space (incl. groups made earlier in
+          // this batch): join that group instead of creating a duplicate.
+          const sameLabelGroup = collectWorkspaceGroups(wsId).get(label)?.element;
+          if (sameLabelGroup?.isConnected) {
+            groupTabs.forEach((tab) =>
+              moveToGroup(tab, sameLabelGroup, label, " (same name as new group)")
+            );
+            continue;
+          }
+
+          try {
+            const newGroup = gBrowser.addTabGroup(groupTabs, {
+              label,
+              insertBefore: groupTabs[0],
+            });
+            if (!newGroup?.isConnected) {
+              console.warn(`[TabSort][Auto] addTabGroup returned no group for "${label}"`);
+              continue;
+            }
+            created.push({ label, count: groupTabs.length });
+            console.log(
+              `[TabSort][Auto] Created group "${label}" with ${groupTabs.length} tab(s)`
+            );
+            // Same favicon-color touch as the broom sort (Advanced Tab Groups).
+            try {
+              if (typeof newGroup._useFaviconColor === "function") {
+                setTimeout(() => newGroup._useFaviconColor(), 500);
+              }
+            } catch (_e) {}
+            if (getAutoIconsEnabled()) {
+              // Fire-and-forget: icons must never delay the sort.
+              assignGroupIconsBackground([
+                {
+                  element: newGroup,
+                  topic: label,
+                  titles: groupTabs
+                    .map((t) => getTabTitle(t))
+                    .filter(Boolean)
+                    .slice(0, 8),
+                },
+              ]).catch((e) => console.error("[TabSort][Auto] Icon pass failed:", e));
+            }
+          } catch (e) {
+            console.error(`[TabSort][Auto] Error creating group "${label}":`, e);
+          }
+        }
+      }
+
+      if (generation === autoSortGeneration) showAutoSortToast(moved, created);
+    } finally {
+      // One retry on the next batch, then give up on the tab for good.
+      if (generation === autoSortGeneration) {
+        let requeued = 0;
+        for (const tab of retryTabs) {
+          if (autoSortHandled.has(tab) || !tab.isConnected) continue;
+          if (autoSortRetried.has(tab)) {
+            autoSortHandled.add(tab);
+            continue;
+          }
+          autoSortRetried.add(tab);
+          autoSortReady.add(tab);
+          requeued++;
+        }
+        if (requeued > 0) {
+          console.log(`[TabSort][Auto] Retrying ${requeued} tab(s) in the next batch`);
+          scheduleAutoSortBatch();
+        }
+      }
+    }
+  };
+
+  const runAutoSortBatch = () => {
+    autoSortTimer = null;
+    try {
+      if (!getAutoSortEnabled()) {
+        autoSortReady.clear();
+        return;
+      }
+      if (autoSortReady.size === 0) return;
+      // Broom sort (or a previous batch) owns the tabs right now: retry
+      // shortly, but not forever.
+      if (isSorting || autoSortPromise) {
+        if (++autoSortBusyRetries > CONFIG.AUTO_SORT_MAX_BUSY_RETRIES) {
+          console.warn(
+            `[TabSort][Auto] Still busy after ${CONFIG.AUTO_SORT_MAX_BUSY_RETRIES} retries, dropping ${autoSortReady.size} tab(s)`
+          );
+          autoSortReady.clear();
+          autoSortBusyRetries = 0;
+          return;
+        }
+        scheduleAutoSortBatch(CONFIG.AUTO_SORT_RETRY_MS);
+        return;
+      }
+      autoSortBusyRetries = 0;
+      const tabs = Array.from(autoSortReady);
+      autoSortReady.clear();
+      console.log(`[TabSort][Auto] Processing ${tabs.length} new tab(s)`);
+      const run = autoSortTabs(tabs).catch((e) =>
+        console.error("[TabSort][Auto] Batch failed:", e)
+      );
+      autoSortPromise = run;
+      run.finally(() => {
+        if (autoSortPromise === run) autoSortPromise = null;
+      });
+    } catch (e) {
+      console.error("[TabSort][Auto] Failed to start batch:", e);
+    }
+  };
+
+  const teardownAutoSort = () => {
+    autoSortGeneration++;
+    for (const [target, name, handler] of autoSortListeners) {
+      try {
+        target.removeEventListener(name, handler);
+      } catch (_e) {}
+    }
+    autoSortListeners = [];
+    if (autoSortTimer != null) {
+      clearTimeout(autoSortTimer);
+      autoSortTimer = null;
+    }
+    if (autoSortArmTimer != null) {
+      clearTimeout(autoSortArmTimer);
+      autoSortArmTimer = null;
+    }
+    autoSortPending = new WeakMap();
+    autoSortReady.clear();
+    autoSortBusyRetries = 0;
+    try {
+      if (window[AUTO_SORT_TEARDOWN_KEY] === teardownAutoSort) {
+        delete window[AUTO_SORT_TEARDOWN_KEY];
+      }
+    } catch (_e) {}
+  };
+
+  // Listeners are always attached (cheap); the pref is checked per event.
+  // Armed only after session restore so restored tabs are never sorted.
+  const setupAutoSort = () => {
+    if (
+      autoSortListeners.length > 0 ||
+      autoSortArmTimer != null ||
+      typeof gBrowser === "undefined" ||
+      !gBrowser.tabContainer
+    ) {
+      return;
+    }
+    try {
+      const previous = window[AUTO_SORT_TEARDOWN_KEY];
+      if (typeof previous === "function" && previous !== teardownAutoSort) {
+        previous();
+      }
+      window[AUTO_SORT_TEARDOWN_KEY] = teardownAutoSort;
+    } catch (_e) {}
+
+    const generation = autoSortGeneration;
+    const arm = () => {
+      autoSortArmTimer = null;
+      if (generation !== autoSortGeneration || autoSortListeners.length > 0) return;
+      const container = gBrowser?.tabContainer;
+      if (!container) return;
+      const listen = (name, handler) => {
+        container.addEventListener(name, handler);
+        autoSortListeners.push([container, name, handler]);
+      };
+      listen("TabOpen", onAutoSortTabOpen);
+      listen("TabAttrModified", onAutoSortTabAttrModified);
+      listen("SSTabRestoring", onAutoSortTabRestoring);
+      listen("TabClose", onAutoSortTabClose);
+      console.log("[TabSort][Auto] Listening for new tabs");
+    };
+
+    let restored = null;
+    try {
+      restored =
+        typeof SessionStore !== "undefined"
+          ? SessionStore.promiseAllWindowsRestored
+          : null;
+    } catch (_e) {}
+    if (restored && typeof restored.then === "function") {
+      restored.then(arm, arm);
+    } else {
+      // Fail closed: without the restore signal, give restore time to
+      // finish rather than risk sorting restored tabs.
+      autoSortArmTimer = setTimeout(arm, CONFIG.AUTO_SORT_ARM_FALLBACK_MS);
+    }
+  };
+
   // --- Add Tab Event Listeners for Visibility Updates ---
   function addTabEventListeners() {
     if (
@@ -3574,6 +4148,9 @@
     try {
       removeMinTabsPrefObserver();
       cancelWarmup();
+      try {
+        teardownAutoSort();
+      } catch (_e) {}
       // Stop any running animations
       cleanupAnimation();
       clearTidyToasts();
@@ -3632,6 +4209,7 @@
           setupMinTabsPrefObserver();
           updateButtonsVisibilityState();
           addTabEventListeners();
+          setupAutoSort();
           // Pre-load ML engines idle so the first sort skips
           // createEngine + model-download latency.
           try {

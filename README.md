@@ -4,6 +4,7 @@ Sort your tabs using Firefox's local AI but make it look awesome!
 ## Features
 - AI tab sorting into topic groups, 100% local (no cloud)
 - Matches tabs into your existing groups before creating new ones
+- Optional auto-sort: new tabs drop into your existing groups as they load (and can start new groups)
 - Smart group names + automatic group icons
 - Workspace suggestions: persistent sidebar card, click a row to move the tab
 - One-click sort button with fast local-model warmup
