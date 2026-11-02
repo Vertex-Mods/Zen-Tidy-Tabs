@@ -20,6 +20,13 @@
     "description": "Type how many ungrouped tabs are needed before the sort button appears. Lower this below 6 to sort with fewer tabs (e.g. 2 or 3). When tab groups already exist, the button still shows with just 1 ungrouped tab."
   },
   {
+    "property": "zen.tidy-tabs.ungrouped-on-top",
+    "label": "Keep ungrouped tabs above groups",
+    "type": "checkbox",
+    "defaultValue": false,
+    "description": "After sorting, tabs that are not in a group go above the groups instead of below them."
+  },
+  {
     "type": "separator",
     "label": "Auto-sort"
   },

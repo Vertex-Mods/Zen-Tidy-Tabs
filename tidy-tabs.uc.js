@@ -62,6 +62,7 @@
   const WORKSPACE_NAME_ONLY_PREF = "zen.tidy-tabs.workspace-name-only";
   const AUTO_SORT_PREF = "zen.tidy-tabs.auto-sort-new-tabs";
   const AUTO_SORT_CREATE_GROUPS_PREF = "zen.tidy-tabs.auto-sort-create-groups";
+  const UNGROUPED_ON_TOP_PREF = "zen.tidy-tabs.ungrouped-on-top";
 
   // User-configurable minimum tab count for the sort button to appear.
   // The user can type any amount (including less than 6) in the mod settings.
@@ -171,6 +172,16 @@
       }
     } catch (e) {
       console.error("[TabSort] Error reading auto-sort pref:", e);
+      return false;
+    }
+  };
+
+  // Where loose tabs end up after a sort: below the groups (default, original
+  // behaviour) or above them.
+  const getUngroupedOnTopEnabled = () => {
+    try {
+      return Services.prefs.getBoolPref(UNGROUPED_ON_TOP_PREF, false);
+    } catch (_e) {
       return false;
     }
   };
@@ -1102,6 +1113,28 @@
       return { groupName: best.groupName, similarity: best.score, matchType: "auto" };
     }
     return null;
+  };
+
+  // Moves the loose tabs that sit below a space's first group up above it,
+  // keeping their order. Zen's empty and Glance tabs stay where they are.
+  const moveLooseTabsAboveGroups = (tabsContainer) => {
+    const children = Array.from(tabsContainer?.children || []);
+    const firstGroupIndex = children.findIndex(
+      (el) => el.tagName?.toLowerCase() === "tab-group"
+    );
+    if (firstGroupIndex === -1) return;
+    const looseTabs = children
+      .slice(firstGroupIndex + 1)
+      .filter(
+        (el) =>
+          el.tagName?.toLowerCase() === "tab" &&
+          !el.pinned &&
+          !el.hasAttribute("zen-empty-tab") &&
+          !el.hasAttribute("zen-glance-tab")
+      );
+    if (looseTabs.length === 0) return;
+    gBrowser.moveTabsBefore(looseTabs, children[firstGroupIndex]);
+    console.log(`[TabSort] Moved ${looseTabs.length} ungrouped tab(s) above the groups`);
   };
 
   // Group naming function (shared singleton engine).
@@ -2930,7 +2963,7 @@
         }
       } // End loop through final groups
 
-      // --- Reorder tabs: groups first, then ungrouped tabs ---
+      // --- Reorder tabs: ungrouped tabs below the groups, or above them (pref) ---
       try {
         const workspaceElement = gZenWorkspaces?.activeWorkspaceElement;
         
@@ -2967,8 +3000,10 @@
           
           console.log("[TabSort] Reorder - groups:", groups.length, "ungrouped:", ungroupedTabs.length);
           
-          // Only reorder if we have both groups AND ungrouped tabs
-          if (groups.length > 0 && ungroupedTabs.length > 0) {
+          if (getUngroupedOnTopEnabled()) {
+            moveLooseTabsAboveGroups(tabsContainer);
+          } else if (groups.length > 0 && ungroupedTabs.length > 0) {
+            // Only reorder if we have both groups AND ungrouped tabs
             console.log("[TabSort] Reorder - Moving ungrouped tabs below groups...");
             
             // Move each ungrouped tab to after the last group
@@ -3904,7 +3939,18 @@
         }
       }
 
-      if (generation === autoSortGeneration) showAutoSortToast(moved, created);
+      if (generation !== autoSortGeneration) return;
+      if (getUngroupedOnTopEnabled()) {
+        for (const wsId of byWorkspace.keys()) {
+          try {
+            const [firstGroup] = collectWorkspaceGroups(wsId).values();
+            moveLooseTabsAboveGroups(firstGroup?.element.parentNode);
+          } catch (e) {
+            console.error("[TabSort][Auto] Error moving ungrouped tabs above groups:", e);
+          }
+        }
+      }
+      showAutoSortToast(moved, created);
     } finally {
       // One retry on the next batch, then give up on the tab for good.
       if (generation === autoSortGeneration) {
