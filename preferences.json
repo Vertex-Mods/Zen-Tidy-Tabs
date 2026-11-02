@@ -24,7 +24,7 @@
     "label": "Keep ungrouped tabs above groups",
     "type": "checkbox",
     "defaultValue": false,
-    "description": "After sorting, tabs that are not in a group go above the groups instead of below them."
+    "description": "Tabs that are not in a group go above the groups instead of below them, in every space: at startup, when you turn this on, and after each sort. Tabs you drag by hand are left where you put them."
   },
   {
     "type": "separator",

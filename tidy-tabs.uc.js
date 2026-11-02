@@ -1137,6 +1137,22 @@
     console.log(`[TabSort] Moved ${looseTabs.length} ungrouped tab(s) above the groups`);
   };
 
+  // Same, for every space's tabs container in this window.
+  const moveLooseTabsAboveGroupsEverywhere = () => {
+    if (!getUngroupedOnTopEnabled()) return;
+    const containers = new Set();
+    document.querySelectorAll("tab-group").forEach((group) => {
+      if (group.parentNode) containers.add(group.parentNode);
+    });
+    for (const container of containers) {
+      try {
+        moveLooseTabsAboveGroups(container);
+      } catch (e) {
+        console.error("[TabSort] Error moving ungrouped tabs above groups:", e);
+      }
+    }
+  };
+
   // Group naming function (shared singleton engine).
   // "Group" results come from three places, all handled below:
   // 1) dead inference port -> engine.run throws -> retry with backoff
@@ -3940,16 +3956,7 @@
       }
 
       if (generation !== autoSortGeneration) return;
-      if (getUngroupedOnTopEnabled()) {
-        for (const wsId of byWorkspace.keys()) {
-          try {
-            const [firstGroup] = collectWorkspaceGroups(wsId).values();
-            moveLooseTabsAboveGroups(firstGroup?.element.parentNode);
-          } catch (e) {
-            console.error("[TabSort][Auto] Error moving ungrouped tabs above groups:", e);
-          }
-        }
-      }
+      moveLooseTabsAboveGroupsEverywhere();
       showAutoSortToast(moved, created);
     } finally {
       // One retry on the next batch, then give up on the tab for good.
@@ -4189,10 +4196,57 @@
     minTabsPrefObserver = null;
   }
 
+  // --- "Keep ungrouped tabs above groups" is a standing rule, not only a
+  // post-sort step: applied in every space once the session is restored, and
+  // again whenever the switch is turned on. Later manual drags are left alone. ---
+  let ungroupedOnTopObserver = null;
+
+  function setupUngroupedOnTop() {
+    if (ungroupedOnTopObserver) return;
+    try {
+      if (typeof Services === "undefined" || !Services.prefs?.addObserver) return;
+      ungroupedOnTopObserver = {
+        observe(_subject, topic, data) {
+          if (topic === "nsPref:changed" && data === UNGROUPED_ON_TOP_PREF) {
+            moveLooseTabsAboveGroupsEverywhere();
+          }
+        },
+      };
+      Services.prefs.addObserver(UNGROUPED_ON_TOP_PREF, ungroupedOnTopObserver);
+    } catch (e) {
+      console.error("[TabSort] Failed to observe ungrouped-on-top pref:", e);
+      ungroupedOnTopObserver = null;
+    }
+    let restored = null;
+    try {
+      restored =
+        typeof SessionStore !== "undefined"
+          ? SessionStore.promiseAllWindowsRestored
+          : null;
+    } catch (_e) {}
+    if (restored && typeof restored.then === "function") {
+      restored.then(moveLooseTabsAboveGroupsEverywhere, () => {});
+    } else {
+      moveLooseTabsAboveGroupsEverywhere();
+    }
+  }
+
+  function removeUngroupedOnTopObserver() {
+    try {
+      if (ungroupedOnTopObserver && typeof Services !== "undefined" && Services.prefs?.removeObserver) {
+        Services.prefs.removeObserver(UNGROUPED_ON_TOP_PREF, ungroupedOnTopObserver);
+      }
+    } catch (_e) {
+      /* ignore */
+    }
+    ungroupedOnTopObserver = null;
+  }
+
   // --- Cleanup Function ---
   const cleanup = () => {
     try {
       removeMinTabsPrefObserver();
+      removeUngroupedOnTopObserver();
       cancelWarmup();
       try {
         teardownAutoSort();
@@ -4256,6 +4310,7 @@
           updateButtonsVisibilityState();
           addTabEventListeners();
           setupAutoSort();
+          setupUngroupedOnTop();
           // Pre-load ML engines idle so the first sort skips
           // createEngine + model-download latency.
           try {
