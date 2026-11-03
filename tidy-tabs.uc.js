@@ -37,8 +37,11 @@
     AUTO_SORT_ARM_FALLBACK_MS: 10000, // Arm delay when SessionStore's restore promise is unavailable
     // A single new tab rarely clears GROUP_SIMILARITY_THRESHOLD against a mixed
     // group, so auto-sort also accepts a clear winner: best score at least
-    // MIN_SIMILARITY and ahead of the runner-up group by MIN_MARGIN.
-    AUTO_SORT_MIN_SIMILARITY: 0.1,
+    // MIN_SIMILARITY and ahead of the runner-up group by MIN_MARGIN. The floor
+    // is what keeps generic pages (sign-in, mail, maps, chat) out: on real
+    // groups they scored up to ~0.36, while genuine members scored ~0.5+.
+    // A space with a single group has no runner-up, so the floor alone decides.
+    AUTO_SORT_MIN_SIMILARITY: 0.45,
     AUTO_SORT_MIN_MARGIN: 0.1,
   };
 
