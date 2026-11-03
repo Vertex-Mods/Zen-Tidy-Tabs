@@ -66,6 +66,7 @@
   const AUTO_SORT_PREF = "zen.tidy-tabs.auto-sort-new-tabs";
   const AUTO_SORT_CREATE_GROUPS_PREF = "zen.tidy-tabs.auto-sort-create-groups";
   const UNGROUPED_ON_TOP_PREF = "zen.tidy-tabs.ungrouped-on-top";
+  const CLOSE_DUPLICATES_PREF = "zen.tidy-tabs.close-duplicates";
 
   // User-configurable minimum tab count for the sort button to appear.
   // The user can type any amount (including less than 6) in the mod settings.
@@ -184,6 +185,15 @@
   const getUngroupedOnTopEnabled = () => {
     try {
       return Services.prefs.getBoolPref(UNGROUPED_ON_TOP_PREF, false);
+    } catch (_e) {
+      return false;
+    }
+  };
+
+  // Off by default: closing tabs is destructive, so the user opts in.
+  const getCloseDuplicatesEnabled = () => {
+    try {
+      return Services.prefs.getBoolPref(CLOSE_DUPLICATES_PREF, false);
     } catch (_e) {
       return false;
     }
@@ -1153,6 +1163,52 @@
       } catch (e) {
         console.error("[TabSort] Error moving ungrouped tabs above groups:", e);
       }
+    }
+  };
+
+  // Closes tabs open more than once (same exact URL) in a space, keeping one
+  // per URL. Closed tabs stay in recently-closed, so Cmd+Shift+T restores them.
+  const closeDuplicateTabs = (workspaceId) => {
+    try {
+      const byUrl = new Map();
+      for (const tab of gBrowser.tabs) {
+        if (
+          tab.getAttribute("zen-workspace-id") !== workspaceId ||
+          tab.pinned ||
+          tab.hasAttribute("zen-essential") ||
+          tab.hasAttribute("zen-empty-tab") ||
+          tab.hasAttribute("zen-glance-tab")
+        ) {
+          continue;
+        }
+        const url = tab.linkedBrowser?.currentURI?.spec;
+        if (!url || url === "about:blank") continue;
+        if (!byUrl.has(url)) byUrl.set(url, []);
+        byUrl.get(url).push(tab);
+      }
+
+      const toClose = [];
+      for (const tabs of byUrl.values()) {
+        if (tabs.length < 2) continue;
+        const keep =
+          tabs.find((t) => t === gBrowser.selectedTab) ||
+          tabs.find((t) => t.hasAttribute("soundplaying")) ||
+          tabs.find((t) => t.closest("tab-group")) ||
+          tabs[0];
+        for (const tab of tabs) {
+          if (tab !== keep && !tab.hasAttribute("soundplaying")) {
+            toClose.push(tab);
+          }
+        }
+      }
+      if (toClose.length === 0) return 0;
+
+      gBrowser.removeTabs(toClose, { animate: false });
+      console.log(`[TabSort] Closed ${toClose.length} duplicate tabs`);
+      return toClose.length;
+    } catch (e) {
+      console.error("[TabSort] Error closing duplicate tabs:", e);
+      return 0;
     }
   };
 
@@ -2642,6 +2698,17 @@
         return; // Exit early
       }
 
+      let closedDuplicates = 0;
+      if (getCloseDuplicatesEnabled()) {
+        closedDuplicates = closeDuplicateTabs(currentWorkspaceId);
+        if (closedDuplicates > 0) {
+          showTidyToast(
+            `Closed ${closedDuplicates} duplicate tab${closedDuplicates === 1 ? "" : "s"}`,
+            "info"
+          );
+        }
+      }
+
       // --- Step 1: Get ALL Existing Group Names for Context ---
       const allExistingGroupNames = new Set();
       const groupSelector = `tab-group:has(tab[zen-workspace-id="${currentWorkspaceId}"])`;
@@ -2674,7 +2741,8 @@
       );
       if (initialTabsToSort.length === 0) {
         console.log("[TabSort] Debug - No tabs to sort, returning early");
-        showTidyToast("Nothing to tidy!", "info");
+        // The duplicates toast already told the user what happened.
+        if (closedDuplicates === 0) showTidyToast("Nothing to tidy!", "info");
         return;
       }
 

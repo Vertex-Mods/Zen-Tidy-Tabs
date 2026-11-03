@@ -27,6 +27,13 @@
     "description": "Tabs that are not in a group go above the groups instead of below them, in every space: at startup, when you turn this on, and after each sort. Tabs you drag by hand are left where you put them."
   },
   {
+    "property": "zen.tidy-tabs.close-duplicates",
+    "label": "Close duplicate tabs when tidying",
+    "type": "checkbox",
+    "defaultValue": false,
+    "description": "When you press the broom, tabs open more than once in this space are closed, keeping one. Reopen with Cmd+Shift+T."
+  },
+  {
     "type": "separator",
     "label": "Auto-sort"
   },
