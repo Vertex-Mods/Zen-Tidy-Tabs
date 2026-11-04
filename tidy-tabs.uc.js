@@ -6,8 +6,10 @@
 
 (() => {
   const CONFIG = {
-    SIMILARITY_THRESHOLD: 0.6, // Tightened from 0.45: 0.45 collapsed same-domain tabs into mega-groups (13x "Swims", 7x "Game"). 0.6 splits by sub-topic.
-    GROUP_SIMILARITY_THRESHOLD: 0.72, // Tightened from 0.65: prevents mis-merges (emulator into AI-native, school into swimming).
+    SIMILARITY_THRESHOLD: 0.6, // Creation bar for NEW groups (raised from 0.45 in v2: 0.45 collapsed same-domain tabs into mega-groups). Kept strict so distinct sub-topics stay split; recall for leftovers is handled by SINGLETON_ATTACH_THRESHOLD below instead of lowering this.
+    GROUP_SIMILARITY_THRESHOLD: 0.68, // Lowered from 0.72 (issue #9): 0.72 left logically-related tabs ungrouped (electrolux manuals vs appliances, gitlab/behance vs online-presence group). 0.68 restores recall while staying above the 0.65 level that caused mis-merges (emulator into AI-native, school into swimming).
+    SINGLETON_ATTACH_THRESHOLD: 0.52, // Second-pass recall bar (issue #9 "half-done" sorts): tabs left as singletons after strict clustering get attached to the nearest new-group centroid when similarity exceeds this. Lower than creation so stragglers join instead of being dropped, still high enough to avoid random merges.
+    EXISTING_GROUP_FALLBACK_MARGIN: 0.08, // Leftover singletons may join an existing group at GROUP_SIMILARITY_THRESHOLD - MARGIN (second chance), so related tabs aren't stranded.
     MIN_TABS_FOR_SORT: 6, // Default fallback for the amount of tabs for the button to show, not the amount of tabs you need in a group. Overridden by the "zen.tidy-tabs.min-tabs-for-sort" pref.
     DEBOUNCE_DELAY: 250,
     ANIMATION_DURATION: 800,
@@ -15,7 +17,8 @@
     INIT_CHECK_INTERVAL: 100,
     CONSOLIDATION_DISTANCE_THRESHOLD: 2,
     EMBEDDING_BATCH_SIZE: 5,
-    EXISTING_GROUP_BOOST: 0.05, // Reduced from 0.1: less pull toward existing groups, lets distinct sub-topics form their own group.
+    EXISTING_GROUP_BOOST: 0.08, // Raised from 0.05 (issue #9): restores pull toward existing groups so related tabs (same person/project) join their folder instead of being stranded. Still below the old 0.1 that over-merged.
+    SAME_HOST_BOOST: 0.07, // Extra boost when a tab shares its bare host with an existing group (issue #9 electrolux appliances vs manuals). Same-site tabs are near-always related; cross-domain mis-merges are unaffected.
     AUTO_ICON_DELAY_MS: 800, // Wait after sort finishes before assigning icons (lets UI settle)
     AUTO_ICON_SIMILARITY_THRESHOLD: 0.3, // Min embedding similarity to accept an icon match (exact group name)
     AUTO_ICON_BROAD_THRESHOLD: 0.25, // Lower bar for the broad name+titles vector (longer text dilutes similarity)
@@ -328,6 +331,24 @@
     }
   };
 
+  // Bare host of a tab URL (lowercased, no www.). Used only for the
+  // same-site affinity boost — never as a grouping rule by itself.
+  const getTabHost = (urlSpec) => {
+    try {
+      const raw = String(urlSpec || "").trim();
+      if (!raw) return "";
+      const u = new URL(raw);
+      if (u.protocol !== "http:" && u.protocol !== "https:") return "";
+      const host = String(u.hostname || "")
+        .toLowerCase()
+        .replace(/^www\./, "");
+      if (!host || host === "localhost" || host === "127.0.0.1") return "";
+      return host;
+    } catch (_e) {
+      return "";
+    }
+  };
+
   // Convert a URL into embedding-friendly text. Generic tokenization only:
   // host with dots -> spaces + path/query segments humanized. Same domains
   // naturally share prefix tokens (higher cosine), divergent paths diverge.
@@ -542,7 +563,14 @@
     return dot / (Math.sqrt(normA) * Math.sqrt(normB));
   }
 
-  // Improved greedy clustering with input validation
+  // Best-fit greedy clustering with input validation.
+  // Old version was first-fit: tab j joined the FIRST seed i with sim >
+  // threshold, so results depended on tab order ("randomic" groupings in
+  // issue #9, e.g. an autodesk tab dragging an unrelated vscode-theming tab
+  // into its group). This version compares each tab against every existing
+  // group CENTROID and joins the BEST one above threshold, creating a new
+  // group only when nothing fits. Centroids update as members join, so
+  // groups stay coherent instead of drifting behind a single seed tab.
   function clusterEmbeddings(vectors, threshold = CONFIG.SIMILARITY_THRESHOLD) {
     if (
       !Array.isArray(vectors) ||
@@ -553,24 +581,33 @@
     }
 
     const groups = [];
-    const used = new Array(vectors.length).fill(false);
+    const centroids = [];
 
     for (let i = 0; i < vectors.length; i++) {
-      if (used[i]) continue;
-      const group = [i];
-      used[i] = true;
+      const vec = vectors[i];
+      if (!Array.isArray(vec) || vec.length === 0) continue;
 
-      for (let j = 0; j < vectors.length; j++) {
-        if (
-          i !== j &&
-          !used[j] &&
-          cosineSimilarity(vectors[i], vectors[j]) > threshold
-        ) {
-          group.push(j);
-          used[j] = true;
+      let bestGroup = -1;
+      let bestSim = -Infinity;
+      for (let g = 0; g < groups.length; g++) {
+        const sim = cosineSimilarity(vec, centroids[g]);
+        if (sim > bestSim) {
+          bestSim = sim;
+          bestGroup = g;
         }
       }
-      groups.push(group);
+
+      if (bestGroup >= 0 && bestSim > threshold) {
+        groups[bestGroup].push(i);
+        try {
+          centroids[bestGroup] = averageEmbedding(
+            groups[bestGroup].map((idx) => vectors[idx])
+          );
+        } catch (_e) {}
+      } else {
+        groups.push([i]);
+        centroids.push(vec);
+      }
     }
     return groups;
   }
@@ -1141,6 +1178,12 @@
                 tabToEmbeddingText(getTabUrlSpec(tab), getTabTitle(tab))
               ),
               tabTitles: groupTabs.map((tab) => getTabTitle(tab)),
+              // Bare hosts for the same-site affinity boost (issue #9:
+              // electrolux manuals should rejoin the electrolux group even
+              // when title/path wording diverges).
+              tabHosts: groupTabs
+                .map((tab) => getTabHost(getTabUrlSpec(tab)))
+                .filter(Boolean),
             });
           }
         }
@@ -1200,6 +1243,20 @@
 
         let similarity = cosineSimilarity(tabEmbedding, groupEmbedding);
         similarity += CONFIG.EXISTING_GROUP_BOOST; // Always boost existing groups
+        // Same-site affinity (issue #9): a tab sharing its bare host with
+        // any tab already in the group is near-always related (electrolux
+        // manuals vs appliances). Cross-domain pairs are unaffected, so the
+        // mis-merges that motivated the v2 tightening can't come back.
+        try {
+          const tabHost = getTabHost(getTabUrlSpec(tab));
+          if (
+            tabHost &&
+            Array.isArray(groupInfo.tabHosts) &&
+            groupInfo.tabHosts.includes(tabHost)
+          ) {
+            similarity += CONFIG.SAME_HOST_BOOST;
+          }
+        } catch (_e) {}
 
         if (similarity > CONFIG.GROUP_SIMILARITY_THRESHOLD && similarity > bestSimilarity) {
           bestMatch = { 
@@ -1283,6 +1340,149 @@
             }
           }
           groups = split;
+        } catch (_e) {}
+
+        // Fallback when strict clustering finds NOTHING (issue #9: workspace
+        // with related tabs but all pairwise sims just under 0.6 → zero
+        // groups → "Nothing to tidy" despite obvious topics). Re-cluster once
+        // at the recall bar instead of giving up; still requires pairs, so
+        // truly unrelated tabs stay ungrouped.
+        try {
+          if (groups.length === 0 && validEmbeddings.length > 1) {
+            const retry = clusterEmbeddings(
+              validEmbeddings,
+              CONFIG.SINGLETON_ATTACH_THRESHOLD
+            ).filter((g) => Array.isArray(g) && g.length > 1);
+            if (retry.length > 0) {
+              console.log(
+                `[TabSort] Strict clustering found no groups, retry at recall bar ${CONFIG.SINGLETON_ATTACH_THRESHOLD.toFixed(2)} gave ${retry.length} group(s)`
+              );
+              groups = retry;
+            }
+          }
+        } catch (_e) {}
+
+        // Recall pass (issue #9 "half-done" sorts): strict clustering leaves
+        // related tabs stranded as singletons (they are dropped by the
+        // length>1 filter below, so a 20-tab workspace ends with one 2-tab
+        // group and 18 untouched tabs). Attach each leftover singleton to
+        // its NEAREST new-group centroid when close enough, instead of
+        // discarding it. Then give still-orphaned singletons a second chance
+        // against EXISTING groups at a slightly relaxed bar.
+        try {
+          const groupedSet = new Set();
+          for (const g of groups) {
+            if (Array.isArray(g)) for (const idx of g) groupedSet.add(idx);
+          }
+          const singletonIdx = [];
+          for (let vi = 0; vi < validEmbeddings.length; vi++) {
+            if (!groupedSet.has(vi)) singletonIdx.push(vi);
+          }
+          if (singletonIdx.length > 0 && groups.length > 0) {
+            const centroids = groups.map((g) => {
+              try {
+                return averageEmbedding(g.map((idx) => validEmbeddings[idx]));
+              } catch (_e) {
+                return null;
+              }
+            });
+            let attached = 0;
+            const stillOrphan = [];
+            for (const si of singletonIdx) {
+              const vec = validEmbeddings[si];
+              let bestG = -1;
+              let bestSim = -Infinity;
+              for (let gi = 0; gi < groups.length; gi++) {
+                const c = centroids[gi];
+                if (!Array.isArray(c) || c.length === 0) continue;
+                const s = cosineSimilarity(vec, c);
+                if (s > bestSim) {
+                  bestSim = s;
+                  bestG = gi;
+                }
+              }
+              if (bestG >= 0 && bestSim > CONFIG.SINGLETON_ATTACH_THRESHOLD) {
+                groups[bestG].push(si);
+                try {
+                  centroids[bestG] = averageEmbedding(
+                    groups[bestG].map((idx) => validEmbeddings[idx])
+                  );
+                } catch (_e) {}
+                attached++;
+              } else {
+                stillOrphan.push(si);
+              }
+            }
+            if (attached > 0) {
+              console.log(
+                `[TabSort] Recall pass attached ${attached} singleton(s) to nearest new group(s) (bar ${CONFIG.SINGLETON_ATTACH_THRESHOLD.toFixed(2)})`
+              );
+            }
+            // Second chance vs existing groups at a relaxed bar, so tabs
+            // related to a folder aren't stranded when just under the full
+            // threshold (issue #9 gitlab/behance vs online-presence group).
+            if (stillOrphan.length > 0 && existingWorkspaceGroups.size > 0) {
+              const relaxed =
+                CONFIG.GROUP_SIMILARITY_THRESHOLD -
+                CONFIG.EXISTING_GROUP_FALLBACK_MARGIN;
+              let reclaimed = 0;
+              const remaining = [];
+              for (const si of stillOrphan) {
+                const vec = validEmbeddings[si];
+                const tab = ungroupedTabs[validIndices[si]];
+                let bestName = null;
+                let bestSim = -Infinity;
+                try {
+                  const tabHost = getTabHost(getTabUrlSpec(tab));
+                  for (const [gName] of existingWorkspaceGroups) {
+                    const ge = existingGroupEmbeddings.get(gName);
+                    if (!ge) continue;
+                    let s = cosineSimilarity(vec, ge);
+                    s += CONFIG.EXISTING_GROUP_BOOST;
+                    try {
+                      const gh =
+                        existingWorkspaceGroups.get(gName)?.tabHosts || [];
+                      if (tabHost && gh.includes(tabHost)) {
+                        s += CONFIG.SAME_HOST_BOOST;
+                      }
+                    } catch (_e) {}
+                    if (s > bestSim) {
+                      bestSim = s;
+                      bestName = gName;
+                    }
+                  }
+                } catch (_e) {}
+                if (bestName && bestSim > relaxed) {
+                  result.push({ tab, topic: bestName });
+                  reclaimed++;
+                } else {
+                  remaining.push(si);
+                }
+              }
+              if (reclaimed > 0) {
+                console.log(
+                  `[TabSort] Reclaimed ${reclaimed} singleton(s) into existing groups at relaxed bar ${relaxed.toFixed(2)}`
+                );
+              }
+              // Prune reclaimed singletons so they aren't reconsidered below.
+              // (groups[] only holds multi-tab indices; reclaimed tabs were
+              // pushed straight to result, so nothing to remove there.)
+              singletonIdx.length = 0;
+              singletonIdx.push(...remaining);
+            }
+            // Log what is still left behind so "half-done" sorts are visible
+            // in the console instead of silent. singletonIdx now holds only
+            // still-orphaned valid indices (reclaimed ones were replaced by
+            // `remaining`), so its length IS the valid remainder. Null-vector
+            // tabs (engine miss) are extra on top of this.
+            try {
+              if (singletonIdx.length > 0) {
+                console.log(
+                  `[TabSort] ${singletonIdx.length} tab(s) remain ungrouped after recall (no group above bars)`
+                );
+              }
+            } catch (_e) {}
+          }
         } catch (_e) {}
 
         if (groups.length > 0) {
@@ -1669,14 +1869,70 @@
                 }
               } catch (_e) {}
 
+              // Anti-truncation (issue #9: group named "aacomo" for an
+              // online-presence group about "giaaaacomo"): the small topic
+              // model sometimes emits a clipped substring of a real title
+              // token. A single-word name that matches NO input token exactly
+              // but sits inside a longer input token (or 1-2 edits away from
+              // one) is a clipping, not an abstraction — fall back to the
+              // centroid title text, which is always a real page title.
+              // Valid short forms ("AI", "PS4") are length<=3 and exempt.
+              try {
+                const STOP2 = new Set(["the", "and", "for", "with", "from", "into", "your", "you", "are"]);
+                const nw = String(name || "")
+                  .toLowerCase()
+                  .split(/[^a-z0-9]+/)
+                  .filter((w) => w.length > 2 && !STOP2.has(w));
+                if (nw.length === 1 && nw[0].length >= 4) {
+                  const word = nw[0];
+                  const inputToks = inputLines
+                    .join("\n")
+                    .toLowerCase()
+                    .split(/[^a-z0-9]+/)
+                    .filter((w) => w.length >= 4);
+                  const inputSet = new Set(inputToks);
+                  const exact =
+                    inputSet.has(word) ||
+                    inputSet.has(`${word}s`) ||
+                    (word.endsWith("s") && inputSet.has(word.slice(0, -1)));
+                  if (!exact) {
+                    let clipped = false;
+                    for (const tok of inputSet) {
+                      if (tok === word) continue;
+                      // Substring either way with a clear length gap, or a
+                      // near-miss edit on a longer token: "aacomo" in
+                      // "giaaaacomo", "autodek" vs "autodesk".
+                      if (
+                        (tok.length >= word.length + 2 &&
+                          (tok.includes(word) || word.includes(tok))) ||
+                        (tok.length >= word.length + 1 &&
+                          levenshteinDistance(word, tok) <= 2)
+                      ) {
+                        clipped = true;
+                        break;
+                      }
+                    }
+                    if (clipped) {
+                      console.log(
+                        `[TabSort][AI] Name "${name}" looks like a clipped input token, using centroid fallback`
+                      );
+                      return centroidFallback();
+                    }
+                  }
+                }
+              } catch (_e) {}
+
               // Embedding check: name must sit near the group centroid.
+              // Bar raised 0.3 -> 0.35 (issue #9): truncated/hallucinated
+              // names ("aacomo", "Game" for Zelda titles) embed away from
+              // the centroid and must fall back to real title text.
               try {
                 if (groupCentroid) {
                   const [nameVec] = await getEmbeddingsForTitles([name], 1);
                   if (nameVec) {
                     const sim = cosineSimilarity(nameVec, groupCentroid);
                     console.log(`[TabSort][AI] Name "${name}" vs centroid: ${sim.toFixed(3)}`);
-                    if (sim < 0.3) {
+                    if (sim < 0.35) {
                       console.log(
                         `[TabSort][AI] Name "${name}" too far from group, using centroid fallback`
                       );
@@ -1734,7 +1990,17 @@
               for (const [groupName, groupInfo] of existingWorkspaceGroups) {
                 const existingEmbedding = existingGroupEmbeddings.get(groupName);
                 if (existingEmbedding) {
-                  const similarity = cosineSimilarity(avgEmbedding, existingEmbedding) + CONFIG.EXISTING_GROUP_BOOST;
+                  let similarity = cosineSimilarity(avgEmbedding, existingEmbedding) + CONFIG.EXISTING_GROUP_BOOST;
+                  // Same-site affinity, mirrored from the per-tab pass.
+                  try {
+                    const newHosts = groupTabs
+                      .map((t) => getTabHost(getTabUrlSpec(t)))
+                      .filter(Boolean);
+                    const oldHosts = groupInfo.tabHosts || [];
+                    if (newHosts.some((h) => oldHosts.includes(h))) {
+                      similarity += CONFIG.SAME_HOST_BOOST;
+                    }
+                  } catch (_e) {}
                   if (similarity > CONFIG.GROUP_SIMILARITY_THRESHOLD * 0.9) { // Slightly lower threshold for group-to-group matching
                     shouldCreateNewGroup = false;
                     targetExistingGroup = groupName;
@@ -3335,14 +3601,13 @@
               if (newGroup && newGroup.isConnected) {
                 existingGroupElementsMap.set(topic, newGroup);
 
-                // Try to set group color to average favicon if advanced-tab-groups is available
-                try {
-                  if (typeof newGroup._useFaviconColor === "function") {
-                    setTimeout(() => newGroup._useFaviconColor(), 500);
-                  }
-                } catch (e) {
-                  // Silently ignore if advanced-tab-groups is not installed
-                }
+                // NOTE (issue #9 p.p.s.): do NOT auto-apply _useFaviconColor.
+                // The favicon-average color is painted as label TEXT in the
+                // expanded state (transparent background) while the collapsed
+                // chip paints text white on the color — so light averages are
+                // readable collapsed but near-invisible expanded. Keep the
+                // default Zen/ATG group color (readable in both states); users
+                // who want per-group colors can still pick them in ATG.
               } else {
                 console.warn(
                   ` -> addTabGroup didn't return a connected element for "${topic}". Attempting fallback find.`
@@ -3355,19 +3620,8 @@
                 if (newGroupElFallback && newGroupElFallback.isConnected) {
                   existingGroupElementsMap.set(topic, newGroupElFallback);
 
-                  // Try to set group color to average favicon if advanced-tab-groups is available
-                  try {
-                    if (
-                      typeof newGroupElFallback._useFaviconColor === "function"
-                    ) {
-                      setTimeout(
-                        () => newGroupElFallback._useFaviconColor(),
-                        500
-                      );
-                    }
-                  } catch (e) {
-                    // Silently ignore if advanced-tab-groups is not installed
-                  }
+                  // NOTE (issue #9 p.p.s.): no _useFaviconColor — see above.
+                  // Default group color stays readable expanded + collapsed.
                 } else {
                   console.error(
                     ` -> Failed to find the newly created group element for "${topic}" even with fallback.`
@@ -3389,14 +3643,7 @@
                 );
                 existingGroupElementsMap.set(topic, groupAfterError);
 
-                // Try to set group color to average favicon if advanced-tab-groups is available
-                try {
-                  if (typeof groupAfterError._useFaviconColor === "function") {
-                    setTimeout(() => groupAfterError._useFaviconColor(), 500);
-                  }
-                } catch (e) {
-                  // Silently ignore if advanced-tab-groups is not installed
-                }
+                // NOTE (issue #9 p.p.s.): no _useFaviconColor — see above.
               } else {
                 console.error(
                   ` -> Failed to find group "${topic}" after creation error.`
