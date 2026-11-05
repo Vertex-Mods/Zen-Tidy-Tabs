@@ -45,6 +45,7 @@
     AUTO_SORT_MIN_MARGIN: 0.1,
     // --- Local LLM (Ollama, opt-in) ---
     LLM_TIMEOUT_MS: 20000, // Per call; the first call also loads the model
+    LLM_MAX_TIMEOUT_MS: 60000, // Cap of the per-call timeout, which scales with tab count
     LLM_DOWN_RETRY_MS: 30000, // After a failure, skip the LLM (no network) for this long
   };
 
@@ -233,10 +234,11 @@
 
   const getLlmEndpoint = () => {
     try {
-      const v = Services.prefs
+      let v = Services.prefs
         .getStringPref(LLM_ENDPOINT_PREF, LLM_DEFAULT_ENDPOINT)
         .trim()
         .replace(/\/+$/, "");
+      if (v && !/^[a-z][a-z0-9+.-]*:\/\//i.test(v)) v = `http://${v}`;
       return v || LLM_DEFAULT_ENDPOINT;
     } catch (_e) {
       return LLM_DEFAULT_ENDPOINT;
@@ -291,17 +293,45 @@
   // One Ollama chat call with a JSON-schema constrained reply. Returns the
   // parsed object or null on ANY failure (never throws). A failure marks the
   // LLM down for LLM_DOWN_RETRY_MS: calls return null instantly, no network.
+  // Per-call timeout grows with the number of tabs in the prompt.
+  const llmTimeoutMs = (tabCount) =>
+    Math.min(CONFIG.LLM_MAX_TIMEOUT_MS, 10000 + 400 * tabCount);
+
+  let llmRemoteWarned = false;
+  const warnIfRemoteEndpoint = (endpoint) => {
+    if (llmRemoteWarned) return;
+    try {
+      const host = new URL(endpoint).hostname;
+      if (!["localhost", "127.0.0.1", "[::1]", "::1"].includes(host)) {
+        llmRemoteWarned = true;
+        console.warn(
+          `[TabSort][LLM] endpoint host "${host}" is not local: tab titles and addresses are sent there`
+        );
+      }
+    } catch (_e) {
+      /* ignore */
+    }
+  };
+
+  // Names no group should get: such tabs stay loose instead.
+  const GENERIC_GROUP_NAME_RE =
+    /^(misc|other|general|various|tabs|uncategorized|miscellaneous|browsing)$/i;
+
   const llmChat = async (
     messages,
     schema,
     { timeoutMs = CONFIG.LLM_TIMEOUT_MS } = {}
   ) => {
+    if (!getLlmEnabled()) return null;
     if (isLlmDownNow()) return null;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      const res = await fetch(`${getLlmEndpoint()}/api/chat`, {
+      const endpoint = getLlmEndpoint();
+      warnIfRemoteEndpoint(endpoint);
+      const res = await fetch(`${endpoint}/api/chat`, {
         method: "POST",
+        credentials: "omit",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           model: getLlmModel(),
@@ -310,11 +340,14 @@
           think: false,
           format: schema,
           keep_alive: "30m",
-          options: { temperature: 0 },
+          options: { temperature: 0, num_ctx: 8192 },
         }),
         signal: controller.signal,
       });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      if (!res.ok) {
+        const detail = (await res.json().catch(() => ({})))?.error;
+        throw new Error(`HTTP ${res.status}${detail ? `: ${detail}` : ""}`);
+      }
       const data = await res.json();
       const parsed = JSON.parse(data?.message?.content);
       if (parsed === null || typeof parsed !== "object") {
@@ -347,7 +380,11 @@
     for (const part of src.split(/[\n;]/)) {
       const idx = part.indexOf("=>");
       if (idx < 0) continue;
-      const pattern = part.slice(0, idx).trim().toLowerCase();
+      const pattern = part
+        .slice(0, idx)
+        .trim()
+        .toLowerCase()
+        .replace(/^[a-z]+:\/\//, "");
       const group = part.slice(idx + 2).trim();
       if (pattern && group) rules.push({ pattern, group });
     }
@@ -371,12 +408,6 @@
     return null;
   };
 
-  // One LLM call that files tabs into groups. `groups` is a Map label ->
-  // { element?, tabTitles? }: real groups (element present) and, for the
-  // broom sort, proposed names that have no element and no member tabs yet.
-  // Returns an array parallel to `tabs` of { group, newGroup } (group is the
-  // real label from `groups`, newGroup a trimmed new name, either may be
-  // null), or null when the LLM is unusable or its reply is invalid.
   // Prompt building blocks shared by llmAssignTabs and llmClusterTabs.
   // `groups` is a Map label -> { element?, tabTitles? }.
   const llmGroupLines = (groups) =>
@@ -403,6 +434,13 @@
     });
 
   const LLM_NEW_GROUP_MAX = 24;
+  const LLM_ASSIGN_CHUNK = 20; // tabs per llmAssignTabs call (broom and auto-sort)
+  // One LLM call that files tabs into groups. `groups` is a Map label ->
+  // { element?, tabTitles? }: real groups (element present) and, for the
+  // broom sort, proposed names that have no element and no member tabs yet.
+  // Returns an array parallel to `tabs` of { group, newGroup } (group is the
+  // real label from `groups`, newGroup a trimmed new name, either may be
+  // null), or null when the LLM is unusable or its reply is invalid.
   const llmAssignTabs = async (tabs, groups, { allowNew = false } = {}) => {
     if (!tabs.length || !isLlmActive()) return null;
     try {
@@ -410,6 +448,8 @@
       const byLower = new Map(labels.map((l) => [l.toLowerCase(), l]));
       const groupLines = llmGroupLines(groups);
       const tabLines = llmTabLines(tabs);
+      // With new groups allowed, the plain "when unsure use null" line made qwen3:4b answer
+      // null for every same-subject pair, so the hedge there is narrower (existing-group match and generic pages only).
       const system =
         "You file browser tabs into tab groups. A tab left ungrouped is fine; a tab in the wrong group is not.\n" +
         "Rules:\n" +
@@ -418,8 +458,6 @@
         (allowNew
           ? '- If two or more tabs fit no existing group but are about the same specific subject, they must all get new_group: one short 1-3 word Title Case name, identical for all tabs of that topic. Example: tabs "Rust ownership explained" and "Rust async book" both get group null and new_group "Rust Docs". A tab with no partner, or a generic utility page, gets null. Never set both group and new_group.\n'
           : '- Always set "new_group" to null.\n') +
-        // With new groups allowed, the plain "when unsure use null" line made qwen3:4b answer
-        // null for every same-subject pair, so the hedge there is narrower (existing-group match and generic pages only).
         (allowNew
           ? "- When unsure whether a tab belongs to an existing group, use null for group; generic pages always get null for both. "
           : "- When unsure about a tab, use null for both. ") +
@@ -450,7 +488,8 @@
           { role: "system", content: system },
           { role: "user", content: user },
         ],
-        schema
+        schema,
+        { timeoutMs: llmTimeoutMs(tabs.length) }
       );
       if (!reply) return null;
       const list = reply.assignments;
@@ -473,7 +512,7 @@
         let newGroup = null;
         if (!group && allowNew) {
           const n = nameOf(a.new_group).slice(0, LLM_NEW_GROUP_MAX).trim();
-          if (n) {
+          if (n && !GENERIC_GROUP_NAME_RE.test(n)) {
             const existing = byLower.get(n.toLowerCase());
             if (existing) group = existing;
             else newGroup = n;
@@ -542,7 +581,8 @@
             { role: "system", content: system },
             { role: "user", content: user },
           ],
-          schema
+          schema,
+          { timeoutMs: llmTimeoutMs(chunk.length) }
         );
         if (!reply) return null;
         if (!Array.isArray(reply.groups)) {
@@ -555,6 +595,7 @@
           let name = typeof g.name === "string" ? g.name.trim() : "";
           name = name.replace(/^['"`]+|['"`]+$/g, "").slice(0, LLM_NEW_GROUP_MAX).trim();
           if (!name || /^(null|none|n\/a|group|untitled|-)$/i.test(name)) continue;
+          if (GENERIC_GROUP_NAME_RE.test(name)) continue; // tabs stay loose
           const idxs = [];
           for (const i of g.tabs) {
             if (!Number.isInteger(i) || i < 0 || i >= chunk.length) continue;
@@ -576,7 +617,6 @@
       return null;
     }
   };
-  // END llmAssignTabs
 
   const getTabIconURL = (tab) => {
     try {
@@ -1630,7 +1670,11 @@
           .replace(/[.?!,:;]+$/, "")
           .slice(0, 24)
           .trim();
-        if (llmName && !/^(group|untitled|new tab)$/i.test(llmName)) {
+        if (
+          llmName &&
+          !/^(group|untitled|new tab)$/i.test(llmName) &&
+          !GENERIC_GROUP_NAME_RE.test(llmName)
+        ) {
           return llmName;
         }
         if (reply) {
@@ -1749,8 +1793,8 @@
         let ok = true;
         if (groups.size > 0) {
           leftover = [];
-          for (let s = 0; s < rest.length && ok; s += LLM_CLUSTER_CHUNK) {
-            const chunk = rest.slice(s, s + LLM_CLUSTER_CHUNK);
+          for (let s = 0; s < rest.length && ok; s += LLM_ASSIGN_CHUNK) {
+            const chunk = rest.slice(s, s + LLM_ASSIGN_CHUNK);
             const assigned = await llmAssignTabs(chunk, groups, {
               allowNew: false,
             });
@@ -3160,7 +3204,14 @@
       try {
         await Promise.race([
           autoSortPromise,
-          sleepMs(CONFIG.AUTO_SORT_BROOM_WAIT_MS),
+          sleepMs(
+            getLlmEnabled()
+              ? Math.max(
+                  CONFIG.AUTO_SORT_BROOM_WAIT_MS,
+                  CONFIG.LLM_MAX_TIMEOUT_MS + 2000
+                )
+              : CONFIG.AUTO_SORT_BROOM_WAIT_MS
+          ),
         ]);
       } catch (_e) {}
     }
@@ -4490,17 +4541,23 @@
           }
         }
 
-        // 2. Local LLM: one call for the rest of this workspace.
+        // 2. Local LLM: chunked calls for the rest of this workspace.
         if (remaining.length > 0 && isLlmActive()) {
           const allowNew = getAutoSortCreateGroupsEnabled();
           const llmTabs = remaining.filter(isAutoSortCandidate);
-          const assignments = llmTabs.length
-            ? await llmAssignTabs(llmTabs, existingGroups, { allowNew })
-            : null;
-          if (shouldStop()) break;
-          if (assignments) {
-            const newByName = new Map(); // lowercase name -> { name, tabs }
-            llmTabs.forEach((tab, i) => {
+          const newByName = new Map(); // lowercase name -> { name, tabs }
+          let llmFailed = false;
+          for (let s = 0; s < llmTabs.length; s += LLM_ASSIGN_CHUNK) {
+            const chunk = llmTabs.slice(s, s + LLM_ASSIGN_CHUNK);
+            const assignments = await llmAssignTabs(chunk, existingGroups, {
+              allowNew,
+            });
+            if (shouldStop()) break;
+            if (!assignments) {
+              llmFailed = true;
+              break;
+            }
+            chunk.forEach((tab, i) => {
               autoSortHandled.add(tab);
               // State may have changed during inference.
               if (!isAutoSortCandidate(tab)) return;
@@ -4514,13 +4571,20 @@
                 newByName.get(key).tabs.push(tab);
               }
             });
-            for (const { name, tabs: groupTabs } of newByName.values()) {
-              if (shouldStop() || !getAutoSortCreateGroupsEnabled()) break;
-              createGroup(wsId, name, groupTabs.filter(isAutoSortCandidate));
-            }
+          }
+          if (shouldStop()) break;
+          for (const { name, tabs: groupTabs } of newByName.values()) {
+            if (shouldStop() || !getAutoSortCreateGroupsEnabled()) break;
+            createGroup(wsId, name, groupTabs.filter(isAutoSortCandidate));
+          }
+          if (!llmFailed) {
+            // Every tab of this batch had its one shot (incl. non-candidates).
+            remaining.forEach((tab) => autoSortHandled.add(tab));
             continue;
           }
-          // LLM failed: built-in embedding path below, unchanged.
+          // LLM failed part-way: tabs it did not cover go to the built-in
+          // embedding path below, unchanged.
+          remaining = remaining.filter((tab) => !autoSortHandled.has(tab));
         }
         if (remaining.length === 0) continue;
 
@@ -4625,7 +4689,8 @@
       // Broom sort (or a previous batch) owns the tabs right now: retry
       // shortly, but not forever.
       if (isSorting || autoSortPromise) {
-        if (++autoSortBusyRetries > CONFIG.AUTO_SORT_MAX_BUSY_RETRIES) {
+        // A broom sort (possibly a slow LLM one) does not use up the budget.
+        if (!isSorting && ++autoSortBusyRetries > CONFIG.AUTO_SORT_MAX_BUSY_RETRIES) {
           console.warn(
             `[TabSort][Auto] Still busy after ${CONFIG.AUTO_SORT_MAX_BUSY_RETRIES} retries, dropping ${autoSortReady.size} tab(s)`
           );
