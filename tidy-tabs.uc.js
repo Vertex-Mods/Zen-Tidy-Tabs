@@ -43,6 +43,9 @@
     // A space with a single group has no runner-up, so the floor alone decides.
     AUTO_SORT_MIN_SIMILARITY: 0.45,
     AUTO_SORT_MIN_MARGIN: 0.1,
+    // --- Local LLM (Ollama, opt-in) ---
+    LLM_TIMEOUT_MS: 20000, // Per call; the first call also loads the model
+    LLM_DOWN_RETRY_MS: 30000, // After a failure, skip the LLM (no network) for this long
   };
 
   // --- Ensure Firefox's local ML engine is enabled ---
@@ -67,6 +70,12 @@
   const AUTO_SORT_CREATE_GROUPS_PREF = "zen.tidy-tabs.auto-sort-create-groups";
   const UNGROUPED_ON_TOP_PREF = "zen.tidy-tabs.ungrouped-on-top";
   const CLOSE_DUPLICATES_PREF = "zen.tidy-tabs.close-duplicates";
+  const LLM_ENABLED_PREF = "zen.tidy-tabs.llm.enabled";
+  const LLM_ENDPOINT_PREF = "zen.tidy-tabs.llm.endpoint";
+  const LLM_MODEL_PREF = "zen.tidy-tabs.llm.model";
+  const RULES_PREF = "zen.tidy-tabs.rules";
+  const LLM_DEFAULT_ENDPOINT = "http://localhost:11434";
+  const LLM_DEFAULT_MODEL = "qwen3:4b";
 
   // User-configurable minimum tab count for the sort button to appear.
   // The user can type any amount (including less than 6) in the mod settings.
@@ -211,6 +220,155 @@
       console.error("[TabSort] Error reading auto-sort create-groups pref:", e);
       return false;
     }
+  };
+
+  // --- Local LLM (Ollama) + site rules: all opt-in ---
+  const getLlmEnabled = () => {
+    try {
+      return Services.prefs.getBoolPref(LLM_ENABLED_PREF, false);
+    } catch (_e) {
+      return false;
+    }
+  };
+
+  const getLlmEndpoint = () => {
+    try {
+      const v = Services.prefs
+        .getStringPref(LLM_ENDPOINT_PREF, LLM_DEFAULT_ENDPOINT)
+        .trim()
+        .replace(/\/+$/, "");
+      return v || LLM_DEFAULT_ENDPOINT;
+    } catch (_e) {
+      return LLM_DEFAULT_ENDPOINT;
+    }
+  };
+
+  const getLlmModel = () => {
+    try {
+      return (
+        Services.prefs.getStringPref(LLM_MODEL_PREF, LLM_DEFAULT_MODEL).trim() ||
+        LLM_DEFAULT_MODEL
+      );
+    } catch (_e) {
+      return LLM_DEFAULT_MODEL;
+    }
+  };
+
+  const getRulesText = () => {
+    try {
+      return Services.prefs.getStringPref(RULES_PREF, "");
+    } catch (_e) {
+      return "";
+    }
+  };
+
+  // Title (max 120 chars) + host/path of a tab. No query string or hash is
+  // ever sent to the model; non-http(s) tabs get an empty url.
+  const tabTextForLlm = (tab) => {
+    let title = "";
+    let url = "";
+    try {
+      title = String(getTabTitle(tab) || "").trim().slice(0, 120);
+    } catch (_e) {
+      /* ignore */
+    }
+    try {
+      const spec = tab?.linkedBrowser?.currentURI?.spec || "";
+      if (/^https?:/i.test(spec)) {
+        const u = new URL(spec);
+        url = u.host + u.pathname;
+      }
+    } catch (_e) {
+      /* ignore */
+    }
+    return { title, url };
+  };
+
+  let llmDownUntil = 0;
+  const isLlmDownNow = () => Date.now() < llmDownUntil;
+  const isLlmActive = () => getLlmEnabled() && !isLlmDownNow();
+
+  // One Ollama chat call with a JSON-schema constrained reply. Returns the
+  // parsed object or null on ANY failure (never throws). A failure marks the
+  // LLM down for LLM_DOWN_RETRY_MS: calls return null instantly, no network.
+  const llmChat = async (
+    messages,
+    schema,
+    { timeoutMs = CONFIG.LLM_TIMEOUT_MS } = {}
+  ) => {
+    if (isLlmDownNow()) return null;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const res = await fetch(`${getLlmEndpoint()}/api/chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: getLlmModel(),
+          messages,
+          stream: false,
+          think: false,
+          format: schema,
+          keep_alive: "30m",
+          options: { temperature: 0 },
+        }),
+        signal: controller.signal,
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      const parsed = JSON.parse(data?.message?.content);
+      if (parsed === null || typeof parsed !== "object") {
+        throw new Error("reply is not a JSON object");
+      }
+      llmDownUntil = 0;
+      return parsed;
+    } catch (e) {
+      const wasUp = !isLlmDownNow();
+      llmDownUntil = Date.now() + CONFIG.LLM_DOWN_RETRY_MS;
+      if (wasUp) {
+        console.warn(
+          `[TabSort][LLM] call failed, using built-in AI for ${
+            CONFIG.LLM_DOWN_RETRY_MS / 1000
+          }s: ${e?.name === "AbortError" ? "timeout" : e?.message || e}`
+        );
+      }
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+
+  // "pattern => Group name" rules, one per line or ';'-separated.
+  let rulesCache = { text: null, rules: [] };
+  const parseRules = (text) => {
+    const src = String(text ?? "");
+    if (rulesCache.text === src) return rulesCache.rules;
+    const rules = [];
+    for (const part of src.split(/[\n;]/)) {
+      const idx = part.indexOf("=>");
+      if (idx < 0) continue;
+      const pattern = part.slice(0, idx).trim().toLowerCase();
+      const group = part.slice(idx + 2).trim();
+      if (pattern && group) rules.push({ pattern, group });
+    }
+    rulesCache = { text: src, rules };
+    return rules;
+  };
+
+  // Group name of the first rule whose pattern is a substring of the tab's
+  // lowercased host + pathname, else null.
+  const matchRule = (tab) => {
+    try {
+      const rules = parseRules(getRulesText());
+      if (!rules.length) return null;
+      const { url } = tabTextForLlm(tab);
+      if (!url) return null;
+      const hay = url.toLowerCase();
+      for (const r of rules) if (hay.includes(r.pattern)) return r.group;
+    } catch (_e) {
+      /* ignore */
+    }
+    return null;
   };
 
   const getTabIconURL = (tab) => {

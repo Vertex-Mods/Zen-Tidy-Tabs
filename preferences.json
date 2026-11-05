@@ -56,6 +56,47 @@
   },
   {
     "type": "separator",
+    "label": "Local LLM (Ollama)"
+  },
+  {
+    "property": "zen.tidy-tabs.llm.enabled",
+    "label": "Use a local LLM (Ollama) for sorting and naming",
+    "type": "checkbox",
+    "defaultValue": false,
+    "description": "Sends tab titles and addresses (no query strings) to Ollama on this Mac. Much more accurate than the built-in AI. If Ollama is not running, the built-in AI is used."
+  },
+  {
+    "property": "zen.tidy-tabs.llm.endpoint",
+    "label": "Ollama address",
+    "type": "string",
+    "placeholder": "http://localhost:11434",
+    "defaultValue": "http://localhost:11434",
+    "description": "Where Ollama is listening.",
+    "conditions": [
+      { "if": { "property": "zen.tidy-tabs.llm.enabled", "value": true } }
+    ]
+  },
+  {
+    "property": "zen.tidy-tabs.llm.model",
+    "label": "Ollama model",
+    "type": "string",
+    "placeholder": "qwen3:4b",
+    "defaultValue": "qwen3:4b",
+    "description": "Name of the Ollama model to use. It must already be pulled.",
+    "conditions": [
+      { "if": { "property": "zen.tidy-tabs.llm.enabled", "value": true } }
+    ]
+  },
+  {
+    "property": "zen.tidy-tabs.rules",
+    "label": "Always put these sites in these groups",
+    "type": "string",
+    "placeholder": "github.com/volumio => Volumio dev; booking.com => Travel",
+    "defaultValue": "",
+    "description": "One rule per line or separated by ';'. Left: part of the address. Right: group name. Rules win over the AI."
+  },
+  {
+    "type": "separator",
     "label": "Group icons"
   },
   {
