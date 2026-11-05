@@ -377,32 +377,39 @@
   // Returns an array parallel to `tabs` of { group, newGroup } (group is the
   // real label from `groups`, newGroup a trimmed new name, either may be
   // null), or null when the LLM is unusable or its reply is invalid.
+  // Prompt building blocks shared by llmAssignTabs and llmClusterTabs.
+  // `groups` is a Map label -> { element?, tabTitles? }.
+  const llmGroupLines = (groups) =>
+    Array.from(groups.keys()).map((label) => {
+      const info = groups.get(label) || {};
+      let titles = info.tabTitles;
+      if (!titles && info.element?.isConnected) {
+        titles = Array.from(info.element.querySelectorAll("tab")).map((t) =>
+          getTabTitle(t)
+        );
+      }
+      titles = (titles || [])
+        .filter(Boolean)
+        .slice(0, 5)
+        .map((t) => String(t).slice(0, 80));
+      return titles.length
+        ? `- "${label}": ${titles.join(" | ")}`
+        : `- "${label}"`;
+    });
+  const llmTabLines = (tabs) =>
+    tabs.map((tab, i) => {
+      const { title, url } = tabTextForLlm(tab);
+      return `${i}. ${title || "(untitled)"}${url ? ` -- ${url}` : ""}`;
+    });
+
   const LLM_NEW_GROUP_MAX = 24;
   const llmAssignTabs = async (tabs, groups, { allowNew = false } = {}) => {
     if (!tabs.length || !isLlmActive()) return null;
     try {
       const labels = Array.from(groups.keys());
       const byLower = new Map(labels.map((l) => [l.toLowerCase(), l]));
-      const groupLines = labels.map((label) => {
-        const info = groups.get(label) || {};
-        let titles = info.tabTitles;
-        if (!titles && info.element?.isConnected) {
-          titles = Array.from(info.element.querySelectorAll("tab")).map((t) =>
-            getTabTitle(t)
-          );
-        }
-        titles = (titles || [])
-          .filter(Boolean)
-          .slice(0, 5)
-          .map((t) => String(t).slice(0, 80));
-        return titles.length
-          ? `- "${label}": ${titles.join(" | ")}`
-          : `- "${label}"`;
-      });
-      const tabLines = tabs.map((tab, i) => {
-        const { title, url } = tabTextForLlm(tab);
-        return `${i}. ${title || "(untitled)"}${url ? ` -- ${url}` : ""}`;
-      });
+      const groupLines = llmGroupLines(groups);
+      const tabLines = llmTabLines(tabs);
       const system =
         "You file browser tabs into tab groups. A tab left ungrouped is fine; a tab in the wrong group is not.\n" +
         "Rules:\n" +
@@ -469,13 +476,98 @@
         }
         out[a.i] = { group, newGroup };
       }
-      if (list.length > 0 && valid === 0) {
+      if (valid === 0) {
         console.warn("[TabSort][LLM] reply had no usable assignments, using built-in AI");
         return null;
       }
       return out;
     } catch (e) {
       console.warn("[TabSort][LLM] assign failed, using built-in AI:", e?.message || e);
+      return null;
+    }
+  };
+  // Broom sort, step 2: group loose tabs that share a clear topic into NEW
+  // named groups (existing groups were already tried via llmAssignTabs).
+  // `existingLabels` is a list of real group labels; a proposed name equal to
+  // one (case-insensitive) is mapped to it. Chunks of 40; later chunks are
+  // told the names proposed so far. Returns [{ name, tabs }] (tabs are the
+  // given tab objects, >= 2 each) or null when the LLM is unusable/invalid.
+  const LLM_CLUSTER_CHUNK = 40;
+  const llmClusterTabs = async (tabs, existingLabels = []) => {
+    if (!tabs.length || !isLlmActive()) return null;
+    try {
+      const byLower = new Map(existingLabels.map((l) => [l.toLowerCase(), l]));
+      const schema = {
+        type: "object",
+        properties: {
+          groups: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                name: { type: "string" },
+                tabs: { type: "array", items: { type: "integer" } },
+              },
+              required: ["name", "tabs"],
+            },
+          },
+        },
+        required: ["groups"],
+      };
+      const merged = new Map(); // lowercase name -> { name, tabs }
+      for (let start = 0; start < tabs.length; start += LLM_CLUSTER_CHUNK) {
+        const chunk = tabs.slice(start, start + LLM_CLUSTER_CHUNK);
+        const proposed = Array.from(merged.values()).map((g) => g.name);
+        const system =
+          "You organize browser tabs into topic groups. Find every set of tabs about the same specific subject, project or activity, and put each set in its own group. A tab left out is fine; a tab in the wrong group is not.\n" +
+          "Rules:\n" +
+          "- A group needs 2 or more tabs about the same subject (same programming language, same trip or destination, same recipe collection, same product, same project). Pages about places or travel inside the same country or city belong together. Tabs do not have to be next to each other in the list, so read every tab and compare it with all the others. Name each group after its own tabs' subject.\n" +
+          "- Group name: 1-3 words, Title Case, max 24 characters, taken from the subject the tabs share.\n" +
+          "- Leave OUT of every group: generic utility pages (email inboxes, maps, search engines, calendars, sign-in or account pages, social media feeds, video homepages) and any tab with no partner on the same subject, such as a lone news article.\n" +
+          "- A tab goes in at most one group. When unsure, leave the tab out.\n" +
+          (proposed.length
+            ? `- Group names already used for earlier tabs: ${proposed
+                .map((n) => `"${n}"`)
+                .join(", ")}. Reuse the exact name when these tabs share that subject.\n`
+            : "") +
+          'Answer with JSON only: {"groups":[{"name":"...","tabs":[tab numbers]}]}. Use exactly the number in [brackets] at the start of each tab line, and re-check that every number you list belongs to that group.';
+        const user = `Tabs:\n${llmTabLines(chunk).map((l) => l.replace(/^(\d+)\. /, "[$1] ")).join("\n")}`;
+        const reply = await llmChat(
+          [
+            { role: "system", content: system },
+            { role: "user", content: user },
+          ],
+          schema
+        );
+        if (!reply) return null;
+        if (!Array.isArray(reply.groups)) {
+          console.warn("[TabSort][LLM] cluster reply has no groups array, using built-in AI");
+          return null;
+        }
+        const used = new Set();
+        for (const g of reply.groups) {
+          if (!g || typeof g !== "object" || !Array.isArray(g.tabs)) continue;
+          let name = typeof g.name === "string" ? g.name.trim() : "";
+          name = name.replace(/^['"`]+|['"`]+$/g, "").slice(0, LLM_NEW_GROUP_MAX).trim();
+          if (!name || /^(null|none|n\/a|group|untitled|-)$/i.test(name)) continue;
+          const idxs = [];
+          for (const i of g.tabs) {
+            if (!Number.isInteger(i) || i < 0 || i >= chunk.length) continue;
+            if (used.has(i) || idxs.includes(i)) continue;
+            idxs.push(i);
+          }
+          if (idxs.length < 2) continue; // first-wins applies only to groups kept
+          idxs.forEach((i) => used.add(i));
+          const key = name.toLowerCase();
+          const label = byLower.get(key) || name;
+          const mkey = label.toLowerCase();
+          if (!merged.has(mkey)) merged.set(mkey, { name: label, tabs: [] });
+          for (const i of idxs) merged.get(mkey).tabs.push(chunk[i]);
+        }
+      }
+      return Array.from(merged.values());
+    } catch (e) {
+      console.warn("[TabSort][LLM] cluster failed, using built-in AI:", e?.message || e);
       return null;
     }
   };
@@ -1503,6 +1595,47 @@
       return fb || "Group";
     };
 
+    // Local LLM first (opt-in); any failure/invalid name falls through to
+    // the smart-tab-topic path below, unchanged.
+    if (isLlmActive()) {
+      try {
+        const lines = (titles || [])
+          .filter(Boolean)
+          .slice(0, 12)
+          .map((t) => `- ${String(t).slice(0, 100)}`)
+          .join("\n");
+        const reply = await llmChat(
+          [
+            {
+              role: "system",
+              content:
+                "You name browser tab groups. Given the titles of the tabs in one group, answer with a short group name: 1-3 words, Title Case, naming the subject the tabs share. Example: titles about baking bread and pizza dough -> {\"name\":\"Baking\"}. Use a concrete subject, not a generic word like Group or Tabs. Always give a name. Answer with JSON only.",
+            },
+            { role: "user", content: `Tab titles:\n${lines}` },
+          ],
+          {
+            type: "object",
+            properties: { name: { type: "string" } },
+            required: ["name"],
+          }
+        );
+        const llmName = String(typeof reply?.name === "string" ? reply.name : "")
+          .trim()
+          .replace(/^['"`]+|['"`]+$/g, "")
+          .replace(/[.?!,:;]+$/, "")
+          .slice(0, 24)
+          .trim();
+        if (llmName && !/^(group|untitled|new tab)$/i.test(llmName)) {
+          return llmName;
+        }
+        if (reply) {
+          console.warn("[TabSort][LLM] unusable group name, using built-in AI:", JSON.stringify(reply.name));
+        }
+      } catch (e) {
+        console.warn("[TabSort][LLM] naming failed, using built-in AI:", e?.message || e);
+      }
+    }
+
     try {
       const knownNamer = namerEnginePromise;
       const engine = await getNamerEngine();
@@ -1564,7 +1697,97 @@
     }
   }
 
+  // Broom sort entry point: site rules first, then the local LLM (when
+  // enabled and reachable), else the built-in embedding code below.
+  // Returns [{ tab, topic }] like the built-in path.
   const askAIForMultipleTopics = async (tabs) => {
+    if (!Array.isArray(tabs) || tabs.length === 0) return [];
+    const hasRules = parseRules(getRulesText()).length > 0;
+    if (!hasRules && !isLlmActive()) return askAIForMultipleTopicsBuiltin(tabs);
+
+    const validTabs = tabs.filter((tab) => tab?.isConnected);
+    if (!validTabs.length) return [];
+    const wsId = window.gZenWorkspaces?.activeWorkspace;
+    const groups = collectWorkspaceGroups(wsId);
+    const labelByLower = new Map(
+      Array.from(groups.keys()).map((l) => [l.toLowerCase(), l])
+    );
+    const result = [];
+
+    // 1. Site rules (exempt from the >= 2 tabs rule). Existing group of the
+    // same name wins; otherwise the rule's name, created by the caller.
+    const rest = [];
+    const ruleLabels = [];
+    for (const tab of validTabs) {
+      const rule = hasRules ? matchRule(tab) : null;
+      if (!rule) {
+        rest.push(tab);
+        continue;
+      }
+      const topic = labelByLower.get(rule.toLowerCase()) || rule;
+      if (!labelByLower.has(topic.toLowerCase())) {
+        labelByLower.set(topic.toLowerCase(), topic);
+        ruleLabels.push(topic);
+      }
+      result.push({ tab, topic });
+    }
+    if (result.length) {
+      console.log(`[TabSort] ${result.length} tab(s) filed by site rules`);
+    }
+    if (!rest.length) return result;
+
+    // 2. Local LLM: existing groups first, then new groups for the leftovers.
+    if (isLlmActive()) {
+      try {
+        const llmResult = [];
+        let leftover = rest;
+        let ok = true;
+        if (groups.size > 0) {
+          leftover = [];
+          for (let s = 0; s < rest.length && ok; s += LLM_CLUSTER_CHUNK) {
+            const chunk = rest.slice(s, s + LLM_CLUSTER_CHUNK);
+            const assigned = await llmAssignTabs(chunk, groups, {
+              allowNew: false,
+            });
+            if (!assigned) {
+              ok = false;
+              break;
+            }
+            chunk.forEach((tab, i) => {
+              const g = assigned[i]?.group;
+              if (g) llmResult.push({ tab, topic: g });
+              else leftover.push(tab);
+            });
+          }
+        }
+        if (ok && leftover.length >= 2) {
+          const clusters = await llmClusterTabs(leftover, [
+            ...groups.keys(),
+            ...ruleLabels,
+          ]);
+          if (!clusters) ok = false;
+          else {
+            for (const { name, tabs: ts } of clusters) {
+              for (const tab of ts) llmResult.push({ tab, topic: name });
+            }
+          }
+        }
+        if (ok) {
+          console.log(
+            `[TabSort][LLM] broom sort: ${llmResult.length} of ${rest.length} tab(s) grouped`
+          );
+          return result.concat(llmResult);
+        }
+      } catch (e) {
+        console.warn("[TabSort][LLM] broom sort failed, using built-in AI:", e?.message || e);
+      }
+    }
+
+    // LLM off or failed: built-in embedding path for the non-rule tabs.
+    return result.concat(await askAIForMultipleTopicsBuiltin(rest));
+  };
+
+  const askAIForMultipleTopicsBuiltin = async (tabs) => {
     if (!Array.isArray(tabs) || tabs.length === 0) return [];
 
     const validTabs = tabs.filter((tab) => tab?.isConnected);
@@ -4265,13 +4488,14 @@
         // 2. Local LLM: one call for the rest of this workspace.
         if (remaining.length > 0 && isLlmActive()) {
           const allowNew = getAutoSortCreateGroupsEnabled();
-          const assignments = await llmAssignTabs(remaining, existingGroups, {
-            allowNew,
-          });
+          const llmTabs = remaining.filter(isAutoSortCandidate);
+          const assignments = llmTabs.length
+            ? await llmAssignTabs(llmTabs, existingGroups, { allowNew })
+            : null;
           if (shouldStop()) break;
           if (assignments) {
             const newByName = new Map(); // lowercase name -> { name, tabs }
-            remaining.forEach((tab, i) => {
+            llmTabs.forEach((tab, i) => {
               autoSortHandled.add(tab);
               // State may have changed during inference.
               if (!isAutoSortCandidate(tab)) return;
