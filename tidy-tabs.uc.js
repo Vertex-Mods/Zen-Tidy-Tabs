@@ -371,6 +371,116 @@
     return null;
   };
 
+  // One LLM call that files tabs into groups. `groups` is a Map label ->
+  // { element?, tabTitles? }: real groups (element present) and, for the
+  // broom sort, proposed names that have no element and no member tabs yet.
+  // Returns an array parallel to `tabs` of { group, newGroup } (group is the
+  // real label from `groups`, newGroup a trimmed new name, either may be
+  // null), or null when the LLM is unusable or its reply is invalid.
+  const LLM_NEW_GROUP_MAX = 24;
+  const llmAssignTabs = async (tabs, groups, { allowNew = false } = {}) => {
+    if (!tabs.length || !isLlmActive()) return null;
+    try {
+      const labels = Array.from(groups.keys());
+      const byLower = new Map(labels.map((l) => [l.toLowerCase(), l]));
+      const groupLines = labels.map((label) => {
+        const info = groups.get(label) || {};
+        let titles = info.tabTitles;
+        if (!titles && info.element?.isConnected) {
+          titles = Array.from(info.element.querySelectorAll("tab")).map((t) =>
+            getTabTitle(t)
+          );
+        }
+        titles = (titles || [])
+          .filter(Boolean)
+          .slice(0, 5)
+          .map((t) => String(t).slice(0, 80));
+        return titles.length
+          ? `- "${label}": ${titles.join(" | ")}`
+          : `- "${label}"`;
+      });
+      const tabLines = tabs.map((tab, i) => {
+        const { title, url } = tabTextForLlm(tab);
+        return `${i}. ${title || "(untitled)"}${url ? ` -- ${url}` : ""}`;
+      });
+      const system =
+        "You file browser tabs into tab groups. A tab left ungrouped is fine; a tab in the wrong group is not.\n" +
+        "Rules:\n" +
+        '- Set "group" to an existing group name when the tab is the same kind of content or topic as that group\'s tabs (for example another recipe for a recipes group, another pull request for a pull request group). Copy the name exactly. If the match is only vague or partial, use null.\n' +
+        "- Generic utility pages always get null for both fields: search engines, sign-in or account pages, email inboxes, maps, calendars, new tab pages, social media feeds, video homepages.\n" +
+        (allowNew
+          ? '- Tabs that fit no existing group but share a specific topic with another listed tab get new_group: one short 1-3 word Title Case name, identical for all tabs of that topic. Example: tabs "Rust ownership explained" and "Rust async book" both get group null and new_group "Rust Docs". A tab with no partner, or a generic utility page, gets null. Never set both group and new_group.\n'
+          : '- Always set "new_group" to null.\n') +
+        '- When unsure about a tab, use null for both. Answer with JSON only: one assignment per tab, using the tab number as "i".';
+      const user =
+        `Existing groups:\n${groupLines.length ? groupLines.join("\n") : "(none)"}\n\n` +
+        `Tabs:\n${tabLines.join("\n")}`;
+      const schema = {
+        type: "object",
+        properties: {
+          assignments: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                i: { type: "integer" },
+                group: { type: ["string", "null"] },
+                new_group: { type: ["string", "null"] },
+              },
+              required: ["i", "group", "new_group"],
+            },
+          },
+        },
+        required: ["assignments"],
+      };
+      const reply = await llmChat(
+        [
+          { role: "system", content: system },
+          { role: "user", content: user },
+        ],
+        schema
+      );
+      if (!reply) return null;
+      const list = reply.assignments;
+      if (!Array.isArray(list)) {
+        console.warn("[TabSort][LLM] reply has no assignments array, using built-in AI");
+        return null;
+      }
+      const out = tabs.map(() => ({ group: null, newGroup: null }));
+      const nameOf = (v) => {
+        const t = typeof v === "string" ? v.trim() : "";
+        return /^(null|none|n\/a|-)?$/i.test(t) ? "" : t;
+      };
+      let valid = 0;
+      for (const a of list) {
+        if (!a || typeof a !== "object") continue;
+        if (!Number.isInteger(a.i) || a.i < 0 || a.i >= tabs.length) continue;
+        valid++;
+        const g = nameOf(a.group).toLowerCase();
+        let group = g ? byLower.get(g) || null : null;
+        let newGroup = null;
+        if (!group && allowNew) {
+          const n = nameOf(a.new_group).slice(0, LLM_NEW_GROUP_MAX).trim();
+          if (n) {
+            const existing = byLower.get(n.toLowerCase());
+            if (existing) group = existing;
+            else newGroup = n;
+          }
+        }
+        out[a.i] = { group, newGroup };
+      }
+      if (list.length > 0 && valid === 0) {
+        console.warn("[TabSort][LLM] reply had no usable assignments, using built-in AI");
+        return null;
+      }
+      return out;
+    } catch (e) {
+      console.warn("[TabSort][LLM] assign failed, using built-in AI:", e?.message || e);
+      return null;
+    }
+  };
+  // END llmAssignTabs
+
   const getTabIconURL = (tab) => {
     try {
       if (!tab?.isConnected) return "";
@@ -4042,6 +4152,66 @@
       }
     };
 
+    // Live (case-insensitive) lookup, so groups made earlier in this batch count.
+    const findGroupByLabel = (wsId, label) => {
+      const want = String(label).toLowerCase();
+      for (const [l, info] of collectWorkspaceGroups(wsId)) {
+        if (l.toLowerCase() === want && info.element?.isConnected) {
+          return { label: l, element: info.element };
+        }
+      }
+      return null;
+    };
+
+    // New group for these tabs, or join the same-named one if it exists.
+    const createGroup = (wsId, label, groupTabs) => {
+      if (groupTabs.length === 0) return;
+      // Name already taken in this space (incl. groups made earlier in
+      // this batch): join that group instead of creating a duplicate.
+      const same = findGroupByLabel(wsId, label);
+      if (same) {
+        groupTabs.forEach((tab) =>
+          moveToGroup(tab, same.element, same.label, " (same name as new group)")
+        );
+        return;
+      }
+      try {
+        const newGroup = gBrowser.addTabGroup(groupTabs, {
+          label,
+          insertBefore: groupTabs[0],
+        });
+        if (!newGroup?.isConnected) {
+          console.warn(`[TabSort][Auto] addTabGroup returned no group for "${label}"`);
+          return;
+        }
+        created.push({ label, count: groupTabs.length });
+        console.log(
+          `[TabSort][Auto] Created group "${label}" with ${groupTabs.length} tab(s)`
+        );
+        // Same favicon-color touch as the broom sort (Advanced Tab Groups).
+        try {
+          if (typeof newGroup._useFaviconColor === "function") {
+            setTimeout(() => newGroup._useFaviconColor(), 500);
+          }
+        } catch (_e) {}
+        if (getAutoIconsEnabled()) {
+          // Fire-and-forget: icons must never delay the sort.
+          assignGroupIconsBackground([
+            {
+              element: newGroup,
+              topic: label,
+              titles: groupTabs
+                .map((t) => getTabTitle(t))
+                .filter(Boolean)
+                .slice(0, 8),
+            },
+          ]).catch((e) => console.error("[TabSort][Auto] Icon pass failed:", e));
+        }
+      } catch (e) {
+        console.error(`[TabSort][Auto] Error creating group "${label}":`, e);
+      }
+    };
+
     try {
       const byWorkspace = new Map();
       for (const tab of tabs) {
@@ -4072,11 +4242,64 @@
           continue;
         }
 
-        const titles = wsTabs.map((tab) => getTabTitle(tab));
+        // 1. Site rules: decided without any AI, so these tabs skip it.
+        let remaining = wsTabs;
+        if (parseRules(getRulesText()).length > 0) {
+          remaining = [];
+          for (const tab of wsTabs) {
+            const ruleLabel = isAutoSortCandidate(tab) ? matchRule(tab) : null;
+            if (!ruleLabel) {
+              remaining.push(tab);
+              continue;
+            }
+            autoSortHandled.add(tab);
+            const existing = findGroupByLabel(wsId, ruleLabel);
+            if (existing) {
+              moveToGroup(tab, existing.element, existing.label, " (rule)");
+            } else if (getAutoSortCreateGroupsEnabled()) {
+              createGroup(wsId, ruleLabel, [tab]);
+            }
+          }
+        }
+
+        // 2. Local LLM: one call for the rest of this workspace.
+        if (remaining.length > 0 && isLlmActive()) {
+          const allowNew = getAutoSortCreateGroupsEnabled();
+          const assignments = await llmAssignTabs(remaining, existingGroups, {
+            allowNew,
+          });
+          if (shouldStop()) break;
+          if (assignments) {
+            const newByName = new Map(); // lowercase name -> { name, tabs }
+            remaining.forEach((tab, i) => {
+              autoSortHandled.add(tab);
+              // State may have changed during inference.
+              if (!isAutoSortCandidate(tab)) return;
+              const { group, newGroup } = assignments[i];
+              if (group) {
+                const groupEl = existingGroups.get(group)?.element;
+                if (groupEl?.isConnected) moveToGroup(tab, groupEl, group, " (llm)");
+              } else if (newGroup && allowNew) {
+                const key = newGroup.toLowerCase();
+                if (!newByName.has(key)) newByName.set(key, { name: newGroup, tabs: [] });
+                newByName.get(key).tabs.push(tab);
+              }
+            });
+            for (const { name, tabs: groupTabs } of newByName.values()) {
+              if (shouldStop() || !getAutoSortCreateGroupsEnabled()) break;
+              createGroup(wsId, name, groupTabs.filter(isAutoSortCandidate));
+            }
+            continue;
+          }
+          // LLM failed: built-in embedding path below, unchanged.
+        }
+        if (remaining.length === 0) continue;
+
+        const titles = remaining.map((tab) => getTabTitle(tab));
         const embeddings = await getEmbeddingsForTitles(titles);
         if (generation !== autoSortGeneration) return;
         // Once a tab has an embedding it has had its one shot.
-        wsTabs.forEach((tab, i) => {
+        remaining.forEach((tab, i) => {
           if (embeddings[i]) autoSortHandled.add(tab);
           else retryTabs.push(tab);
         });
@@ -4085,8 +4308,8 @@
 
         const unmatchedTabs = [];
         const unmatchedEmbeddings = [];
-        for (let i = 0; i < wsTabs.length; i++) {
-          const tab = wsTabs[i];
+        for (let i = 0; i < remaining.length; i++) {
+          const tab = remaining[i];
           if (!embeddings[i]) continue;
           // State may have changed during inference (closed, grouped, pinned...).
           if (!isAutoSortCandidate(tab)) continue;
@@ -4133,54 +4356,7 @@
           const label = await nameGroupWithSmartTabTopic(clusterTitles);
           // Naming is async: re-validate before touching the DOM.
           if (shouldStop()) break;
-          const groupTabs = clusterTabs.filter(isAutoSortCandidate);
-          if (groupTabs.length === 0) continue;
-
-          // Name already taken in this space (incl. groups made earlier in
-          // this batch): join that group instead of creating a duplicate.
-          const sameLabelGroup = collectWorkspaceGroups(wsId).get(label)?.element;
-          if (sameLabelGroup?.isConnected) {
-            groupTabs.forEach((tab) =>
-              moveToGroup(tab, sameLabelGroup, label, " (same name as new group)")
-            );
-            continue;
-          }
-
-          try {
-            const newGroup = gBrowser.addTabGroup(groupTabs, {
-              label,
-              insertBefore: groupTabs[0],
-            });
-            if (!newGroup?.isConnected) {
-              console.warn(`[TabSort][Auto] addTabGroup returned no group for "${label}"`);
-              continue;
-            }
-            created.push({ label, count: groupTabs.length });
-            console.log(
-              `[TabSort][Auto] Created group "${label}" with ${groupTabs.length} tab(s)`
-            );
-            // Same favicon-color touch as the broom sort (Advanced Tab Groups).
-            try {
-              if (typeof newGroup._useFaviconColor === "function") {
-                setTimeout(() => newGroup._useFaviconColor(), 500);
-              }
-            } catch (_e) {}
-            if (getAutoIconsEnabled()) {
-              // Fire-and-forget: icons must never delay the sort.
-              assignGroupIconsBackground([
-                {
-                  element: newGroup,
-                  topic: label,
-                  titles: groupTabs
-                    .map((t) => getTabTitle(t))
-                    .filter(Boolean)
-                    .slice(0, 8),
-                },
-              ]).catch((e) => console.error("[TabSort][Auto] Icon pass failed:", e));
-            }
-          } catch (e) {
-            console.error(`[TabSort][Auto] Error creating group "${label}":`, e);
-          }
+          createGroup(wsId, label, clusterTabs.filter(isAutoSortCandidate));
         }
       }
 
