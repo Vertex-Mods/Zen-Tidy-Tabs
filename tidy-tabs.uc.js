@@ -434,7 +434,12 @@
     });
 
   const LLM_NEW_GROUP_MAX = 24;
-  const LLM_ASSIGN_CHUNK = 20; // tabs per llmAssignTabs call (broom and auto-sort)
+  // Tabs per llmAssignTabs call (broom and auto-sort). One tab per call: 20-tab chunks
+  // dumped generic pages into groups (16 wrong of 60); single calls gave 2 wrong. The
+  // system prompt and groups block precede the tab text and are identical across
+  // calls, so Ollama reuses its prefix (KV) cache.
+  const LLM_ASSIGN_CHUNK = 1;
+  const LLM_NEWGROUP_CHUNK = 20; // auto-sort pass 2: loose tabs per call when proposing new groups
   // One LLM call that files tabs into groups. `groups` is a Map label ->
   // { element?, tabTitles? }: real groups (element present) and, for the
   // broom sort, proposed names that have no element and no member tabs yet.
@@ -643,6 +648,7 @@
 
   // --- Globals & State ---
   let isSorting = false;
+  let broomWaiting = false; // broom click waiting for an in-flight auto-sort batch: tells it to stop
   let sortButtonListenerAdded = false;
   let isPlayingFailureAnimation = false;
   let sortAnimationId = null;
@@ -1791,6 +1797,7 @@
         const llmResult = [];
         let leftover = rest;
         let ok = true;
+        let failedAt = -1;
         if (groups.size > 0) {
           leftover = [];
           for (let s = 0; s < rest.length && ok; s += LLM_ASSIGN_CHUNK) {
@@ -1799,6 +1806,9 @@
               allowNew: false,
             });
             if (!assigned) {
+              // Keep tabs already assigned; the failed chunk and every
+              // later tab go to the built-in path with the leftovers.
+              failedAt = s;
               ok = false;
               break;
             }
@@ -1808,6 +1818,15 @@
               else leftover.push(tab);
             });
           }
+        }
+        if (failedAt >= 0) {
+          console.log(
+            `[TabSort][LLM] broom sort: LLM failed at tab ${failedAt}, built-in AI for the rest`
+          );
+          const unassigned = leftover.concat(rest.slice(failedAt));
+          return result
+            .concat(llmResult)
+            .concat(await askAIForMultipleTopicsBuiltin(unassigned));
         }
         if (ok && leftover.length >= 2) {
           const clusters = await llmClusterTabs(leftover, [
@@ -3201,6 +3220,7 @@
     // silently ignored and both never move the same tabs at once.
     // Bounded, so a hung batch can't block the broom forever.
     if (autoSortPromise) {
+      broomWaiting = true;
       try {
         await Promise.race([
           autoSortPromise,
@@ -3214,6 +3234,7 @@
           ),
         ]);
       } catch (_e) {}
+      broomWaiting = false;
     }
     if (isSorting) return;
     isSorting = true;
@@ -4413,7 +4434,10 @@
     const generation = autoSortGeneration;
     // Teardown (Sine re-run / unload), pref off, or broom sort running.
     const shouldStop = () =>
-      generation !== autoSortGeneration || !getAutoSortEnabled() || isSorting;
+      generation !== autoSortGeneration ||
+      !getAutoSortEnabled() ||
+      isSorting ||
+      broomWaiting;
     const retryTabs = []; // transient failures (no embedding, state not settled)
     const moved = []; // group label per moved tab
     const created = []; // { label, count }
@@ -4547,10 +4571,13 @@
           const llmTabs = remaining.filter(isAutoSortCandidate);
           const newByName = new Map(); // lowercase name -> { name, tabs }
           let llmFailed = false;
+          const loose = []; // tabs no existing group took
+          // Pass 1: one tab per call against the existing groups only.
           for (let s = 0; s < llmTabs.length; s += LLM_ASSIGN_CHUNK) {
+            if (shouldStop()) break;
             const chunk = llmTabs.slice(s, s + LLM_ASSIGN_CHUNK);
             const assignments = await llmAssignTabs(chunk, existingGroups, {
-              allowNew,
+              allowNew: false,
             });
             if (shouldStop()) break;
             if (!assignments) {
@@ -4561,16 +4588,33 @@
               autoSortHandled.add(tab);
               // State may have changed during inference.
               if (!isAutoSortCandidate(tab)) return;
-              const { group, newGroup } = assignments[i];
-              if (group) {
-                const groupEl = existingGroups.get(group)?.element;
-                if (groupEl?.isConnected) moveToGroup(tab, groupEl, group, " (llm)");
-              } else if (newGroup && allowNew) {
+              const group = assignments[i]?.group;
+              const groupEl = group ? existingGroups.get(group)?.element : null;
+              if (groupEl?.isConnected) moveToGroup(tab, groupEl, group, " (llm)");
+              else loose.push(tab);
+            });
+          }
+          // Pass 2: a new group needs 2+ tabs on one subject, which a
+          // single-tab call can't see, so the loose tabs go in batches.
+          if (allowNew && !llmFailed && !shouldStop() && loose.length >= 2) {
+            for (let s = 0; s < loose.length; s += LLM_NEWGROUP_CHUNK) {
+              if (shouldStop()) break;
+              const chunk = loose.slice(s, s + LLM_NEWGROUP_CHUNK);
+              if (chunk.length < 2) break;
+              const assignments = await llmAssignTabs(chunk, existingGroups, {
+                allowNew: true,
+              });
+              if (shouldStop()) break;
+              if (!assignments) break; // tabs stay loose; they were handled in pass 1
+              chunk.forEach((tab, i) => {
+                if (!isAutoSortCandidate(tab)) return;
+                const newGroup = assignments[i]?.newGroup;
+                if (!newGroup) return;
                 const key = newGroup.toLowerCase();
                 if (!newByName.has(key)) newByName.set(key, { name: newGroup, tabs: [] });
                 newByName.get(key).tabs.push(tab);
-              }
-            });
+              });
+            }
           }
           if (shouldStop()) break;
           for (const { name, tabs: groupTabs } of newByName.values()) {
