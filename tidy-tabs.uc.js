@@ -416,9 +416,14 @@
         '- Set "group" to an existing group name when the tab is the same kind of content or topic as that group\'s tabs (for example another recipe for a recipes group, another pull request for a pull request group). Copy the name exactly. If the match is only vague or partial, use null.\n' +
         "- Generic utility pages always get null for both fields: search engines, sign-in or account pages, email inboxes, maps, calendars, new tab pages, social media feeds, video homepages.\n" +
         (allowNew
-          ? '- Tabs that fit no existing group but share a specific topic with another listed tab get new_group: one short 1-3 word Title Case name, identical for all tabs of that topic. Example: tabs "Rust ownership explained" and "Rust async book" both get group null and new_group "Rust Docs". A tab with no partner, or a generic utility page, gets null. Never set both group and new_group.\n'
+          ? '- If two or more tabs fit no existing group but are about the same specific subject, they must all get new_group: one short 1-3 word Title Case name, identical for all tabs of that topic. Example: tabs "Rust ownership explained" and "Rust async book" both get group null and new_group "Rust Docs". A tab with no partner, or a generic utility page, gets null. Never set both group and new_group.\n'
           : '- Always set "new_group" to null.\n') +
-        '- When unsure about a tab, use null for both. Answer with JSON only: one assignment per tab, using the tab number as "i".';
+        // With new groups allowed, the plain "when unsure use null" line made qwen3:4b answer
+        // null for every same-subject pair, so the hedge there is narrower (existing-group match and generic pages only).
+        (allowNew
+          ? "- When unsure whether a tab belongs to an existing group, use null for group; generic pages always get null for both. "
+          : "- When unsure about a tab, use null for both. ") +
+        'Answer with JSON only: one assignment per tab, using the tab number as "i".';
       const user =
         `Existing groups:\n${groupLines.length ? groupLines.join("\n") : "(none)"}\n\n` +
         `Tabs:\n${tabLines.join("\n")}`;
