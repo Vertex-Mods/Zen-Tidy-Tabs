@@ -46,6 +46,8 @@
     // is what keeps generic pages (sign-in, mail, maps, chat) out: on real
     // groups they scored up to ~0.36, while genuine members scored ~0.5+.
     // A space with a single group has no runner-up, so the floor alone decides.
+    // NOTE: 0.45 floor was calibrated on title-only embeddings. Since v2.0.1
+    // auto-sort embeds URL+title (title-only for non-web URLs), so it may need re-calibration.
     AUTO_SORT_MIN_SIMILARITY: 0.45,
     AUTO_SORT_MIN_MARGIN: 0.1,
     // --- Local LLM (Ollama, opt-in) ---
@@ -446,11 +448,11 @@
   const LLM_ASSIGN_CHUNK = 1;
   const LLM_NEWGROUP_CHUNK = 20; // auto-sort pass 2: loose tabs per llmClusterTabs call
   // One LLM call that files tabs into groups. `groups` is a Map label ->
-  // { element?, tabTitles? }: real groups (element present) and, for the
-  // broom sort, proposed names that have no element and no member tabs yet.
-  // Existing groups only: new groups come from llmClusterTabs. Returns an
-  // array parallel to `tabs` of { group } (the real label from `groups`, or
-  // null), or null when the LLM is unusable or its reply is invalid.
+  // { element?, tabTitles? }: existing groups only (callers pass real groups
+  // from collectWorkspaceGroups, element and tabTitles set). No proposed names
+  // are passed anymore. New groups come from llmClusterTabs. Returns an array
+  // parallel to `tabs` of { group } (the real label from `groups`, or null),
+  // or null when the LLM is unusable or its reply is invalid.
   const llmAssignTabs = async (tabs, groups) => {
     if (!tabs.length || !isLlmActive()) return null;
     try {
@@ -458,6 +460,9 @@
       const byLower = new Map(labels.map((l) => [l.toLowerCase(), l]));
       const groupLines = llmGroupLines(groups);
       const tabLines = llmTabLines(tabs);
+      // Kept on purpose: the "new_group" field and the "null for both fields"
+      // wording stay so the prompt is byte-identical (prefix/KV-cache reuse,
+      // tested wording), even though callers only read "group".
       const system =
         "You file browser tabs into tab groups. A tab left ungrouped is fine; a tab in the wrong group is not.\n" +
         "Rules:\n" +
@@ -5511,10 +5516,10 @@
         // Same text form as the group vectors (embedWorkspaceGroups) and the
         // broom sort: URL + title.
         const titles = remaining.map((tab) => getTabTitle(tab));
-        const embedTexts = remaining.map((tab, i) =>
+        const texts = remaining.map((tab, i) =>
           tabToEmbeddingText(getTabUrlSpec(tab), titles[i] || "")
         );
-        const embeddings = await getEmbeddingsForTitles(embedTexts);
+        const embeddings = await getEmbeddingsForTitles(texts);
         if (generation !== autoSortGeneration) return;
         // Once a tab has an embedding it has had its one shot.
         remaining.forEach((tab, i) => {
