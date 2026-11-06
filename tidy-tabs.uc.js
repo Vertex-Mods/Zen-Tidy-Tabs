@@ -444,33 +444,27 @@
   // system prompt and groups block precede the tab text and are identical across
   // calls, so Ollama reuses its prefix (KV) cache.
   const LLM_ASSIGN_CHUNK = 1;
-  const LLM_NEWGROUP_CHUNK = 20; // auto-sort pass 2: loose tabs per call when proposing new groups
+  const LLM_NEWGROUP_CHUNK = 20; // auto-sort pass 2: loose tabs per llmClusterTabs call
   // One LLM call that files tabs into groups. `groups` is a Map label ->
   // { element?, tabTitles? }: real groups (element present) and, for the
   // broom sort, proposed names that have no element and no member tabs yet.
-  // Returns an array parallel to `tabs` of { group, newGroup } (group is the
-  // real label from `groups`, newGroup a trimmed new name, either may be
+  // Existing groups only: new groups come from llmClusterTabs. Returns an
+  // array parallel to `tabs` of { group } (the real label from `groups`, or
   // null), or null when the LLM is unusable or its reply is invalid.
-  const llmAssignTabs = async (tabs, groups, { allowNew = false } = {}) => {
+  const llmAssignTabs = async (tabs, groups) => {
     if (!tabs.length || !isLlmActive()) return null;
     try {
       const labels = Array.from(groups.keys());
       const byLower = new Map(labels.map((l) => [l.toLowerCase(), l]));
       const groupLines = llmGroupLines(groups);
       const tabLines = llmTabLines(tabs);
-      // With new groups allowed, the plain "when unsure use null" line made qwen3:4b answer
-      // null for every same-subject pair, so the hedge there is narrower (existing-group match and generic pages only).
       const system =
         "You file browser tabs into tab groups. A tab left ungrouped is fine; a tab in the wrong group is not.\n" +
         "Rules:\n" +
         '- Set "group" to an existing group name when the tab is the same kind of content or topic as that group\'s tabs (for example another recipe for a recipes group, another pull request for a pull request group). Copy the name exactly. If the match is only vague or partial, use null.\n' +
         "- Generic utility pages always get null for both fields: search engines, sign-in or account pages, email inboxes, maps, calendars, new tab pages, social media feeds, video homepages.\n" +
-        (allowNew
-          ? '- If two or more tabs fit no existing group but are about the same specific subject, they must all get new_group: one short 1-3 word Title Case name, identical for all tabs of that topic. Example: tabs "Rust ownership explained" and "Rust async book" both get group null and new_group "Rust Docs". A tab with no partner, or a generic utility page, gets null. Never set both group and new_group.\n'
-          : '- Always set "new_group" to null.\n') +
-        (allowNew
-          ? "- When unsure whether a tab belongs to an existing group, use null for group; generic pages always get null for both. "
-          : "- When unsure about a tab, use null for both. ") +
+        '- Always set "new_group" to null.\n' +
+        "- When unsure about a tab, use null for both. " +
         'Answer with JSON only: one assignment per tab, using the tab number as "i".';
       const user =
         `Existing groups:\n${groupLines.length ? groupLines.join("\n") : "(none)"}\n\n` +
@@ -507,7 +501,7 @@
         console.warn("[TabSort][LLM] reply has no assignments array, using built-in AI");
         return null;
       }
-      const out = tabs.map(() => ({ group: null, newGroup: null }));
+      const out = tabs.map(() => ({ group: null }));
       const nameOf = (v) => {
         const t = typeof v === "string" ? v.trim() : "";
         return /^(null|none|n\/a|-)?$/i.test(t) ? "" : t;
@@ -518,17 +512,7 @@
         if (!Number.isInteger(a.i) || a.i < 0 || a.i >= tabs.length) continue;
         valid++;
         const g = nameOf(a.group).toLowerCase();
-        let group = g ? byLower.get(g) || null : null;
-        let newGroup = null;
-        if (!group && allowNew) {
-          const n = nameOf(a.new_group).slice(0, LLM_NEW_GROUP_MAX).trim();
-          if (n && !GENERIC_GROUP_NAME_RE.test(n)) {
-            const existing = byLower.get(n.toLowerCase());
-            if (existing) group = existing;
-            else newGroup = n;
-          }
-        }
-        out[a.i] = { group, newGroup };
+        out[a.i] = { group: g ? byLower.get(g) || null : null };
       }
       if (valid === 0) {
         console.warn("[TabSort][LLM] reply had no usable assignments, using built-in AI");
@@ -2391,9 +2375,7 @@
           leftover = [];
           for (let s = 0; s < rest.length && ok; s += LLM_ASSIGN_CHUNK) {
             const chunk = rest.slice(s, s + LLM_ASSIGN_CHUNK);
-            const assigned = await llmAssignTabs(chunk, groups, {
-              allowNew: false,
-            });
+            const assigned = await llmAssignTabs(chunk, groups);
             if (!assigned) {
               // Keep tabs already assigned; the failed chunk and every
               // later tab go to the built-in path with the leftovers.
@@ -5452,7 +5434,7 @@
 
         // 2. Local LLM: chunked calls for the rest of this workspace.
         if (remaining.length > 0 && isLlmActive()) {
-          const allowNew = getAutoSortCreateGroupsEnabled();
+          const createNew = getAutoSortCreateGroupsEnabled();
           const llmTabs = remaining.filter(isAutoSortCandidate);
           const newByName = new Map(); // lowercase name -> { name, tabs }
           let llmFailed = false;
@@ -5461,9 +5443,7 @@
           for (let s = 0; s < llmTabs.length; s += LLM_ASSIGN_CHUNK) {
             if (shouldStop()) break;
             const chunk = llmTabs.slice(s, s + LLM_ASSIGN_CHUNK);
-            const assignments = await llmAssignTabs(chunk, existingGroups, {
-              allowNew: false,
-            });
+            const assignments = await llmAssignTabs(chunk, existingGroups);
             if (shouldStop()) break;
             if (!assignments) {
               llmFailed = true;
@@ -5480,31 +5460,42 @@
             });
           }
           // Pass 2: a new group needs 2+ tabs on one subject, which a
-          // single-tab call can't see, so the loose tabs go in batches.
-          if (allowNew && !llmFailed && !shouldStop() && loose.length >= 2) {
+          // single-tab call can't see, so the loose tabs go in batches to the
+          // broom's cluster prompt. It does not see the existing groups (that
+          // block made qwen3:4b refuse new groups), and a cluster named like
+          // an existing group is dropped: pass 1 is the only way into one.
+          if (createNew && !llmFailed && !shouldStop() && loose.length >= 2) {
+            const existingLower = new Set(
+              Array.from(existingGroups.keys()).map((l) => l.toLowerCase())
+            );
             for (let s = 0; s < loose.length; s += LLM_NEWGROUP_CHUNK) {
+              if (shouldStop() || !getAutoSortCreateGroupsEnabled()) break;
+              const chunk = loose.slice(s, s + LLM_NEWGROUP_CHUNK).filter(isAutoSortCandidate);
+              if (chunk.length < 2) continue;
+              const clusters = await llmClusterTabs(chunk, Array.from(existingGroups.keys()));
               if (shouldStop()) break;
-              const chunk = loose.slice(s, s + LLM_NEWGROUP_CHUNK);
-              if (chunk.length < 2) break;
-              const assignments = await llmAssignTabs(chunk, existingGroups, {
-                allowNew: true,
-              });
-              if (shouldStop()) break;
-              if (!assignments) break; // tabs stay loose; they were handled in pass 1
-              chunk.forEach((tab, i) => {
-                if (!isAutoSortCandidate(tab)) return;
-                const newGroup = assignments[i]?.newGroup;
-                if (!newGroup) return;
-                const key = newGroup.toLowerCase();
-                if (!newByName.has(key)) newByName.set(key, { name: newGroup, tabs: [] });
-                newByName.get(key).tabs.push(tab);
-              });
+              if (!clusters) break; // tabs stay loose; they were handled in pass 1
+              for (const { name, tabs: clusterTabs } of clusters) {
+                const key = name.toLowerCase();
+                if (existingLower.has(key)) {
+                  console.log(
+                    `[TabSort][Auto] LLM cluster "${name}" matches an existing group, leaving ${clusterTabs.length} tab(s) loose`
+                  );
+                  continue;
+                }
+                const members = clusterTabs.filter(isAutoSortCandidate);
+                if (members.length < 2) continue;
+                if (!newByName.has(key)) newByName.set(key, { name, tabs: [] });
+                newByName.get(key).tabs.push(...members);
+              }
             }
           }
           if (shouldStop()) break;
           for (const { name, tabs: groupTabs } of newByName.values()) {
             if (shouldStop() || !getAutoSortCreateGroupsEnabled()) break;
-            createGroup(wsId, name, groupTabs.filter(isAutoSortCandidate));
+            const members = groupTabs.filter(isAutoSortCandidate);
+            if (members.length < 2) continue;
+            createGroup(wsId, name, members);
           }
           if (!llmFailed) {
             // Every tab of this batch had its one shot (incl. non-candidates).
