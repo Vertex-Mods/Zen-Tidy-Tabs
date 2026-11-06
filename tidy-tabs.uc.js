@@ -897,10 +897,14 @@
     "about:blank",
   ]);
   const tabToEmbeddingText = (urlSpec, title = "") => {
-    const urlPart = urlToEmbeddingText(urlSpec, "");
+    // URL tokens only for real web hosts. For file:, localhost, about: etc.
+    // urlToEmbeddingText returns the raw URL, whose long shared prefix
+    // (same folder / same dev server) would dominate the text and make
+    // unrelated pages look alike — the title is the meaningful part there.
+    const urlPart = getTabHost(urlSpec) ? urlToEmbeddingText(urlSpec, "") : "";
     const t = String(title || "").trim().slice(0, 120);
     if (!t || GENERIC_TITLES.has(t.toLowerCase())) {
-      return urlPart || t.slice(0, 256);
+      return urlPart || urlToEmbeddingText(urlSpec, "") || t.slice(0, 256);
     }
     if (!urlPart) return t.slice(0, 256);
     // Skip title if it's just the bare domain restated (e.g. title
