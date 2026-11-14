@@ -20,6 +20,49 @@
     "description": "Type how many ungrouped tabs are needed before the sort button appears. Lower this below 6 to sort with fewer tabs (e.g. 2 or 3). When tab groups already exist, the button still shows with just 1 ungrouped tab."
   },
   {
+    "property": "zen.tidy-tabs.ungrouped-on-top",
+    "label": "Keep ungrouped tabs above groups",
+    "type": "checkbox",
+    "defaultValue": false,
+    "description": "Tabs that are not in a group go above the groups instead of below them, in every space: at startup, when you turn this on, and after each sort. Tabs you drag by hand are left where you put them."
+  },
+  {
+    "property": "zen.tidy-tabs.close-duplicates",
+    "label": "Close duplicate tabs when tidying",
+    "type": "checkbox",
+    "defaultValue": false,
+    "description": "When you press the broom, tabs open more than once in this space are closed, keeping one. Reopen with Cmd+Shift+T."
+  },
+  {
+    "type": "separator",
+    "label": "Auto-sort"
+  },
+  {
+    "property": "zen.tidy-tabs.auto-sort-new-tabs",
+    "label": "Automatically sort new tabs into existing groups",
+    "type": "checkbox",
+    "defaultValue": false,
+    "description": "When a new tab finishes loading, the local AI moves it into the group in its space that clearly fits best. Tabs you drag out are never moved again."
+  },
+  {
+    "property": "zen.tidy-tabs.auto-sort-create-groups",
+    "label": "Create a new group when no group fits",
+    "type": "checkbox",
+    "defaultValue": false,
+    "description": "Off: tabs that match no group stay ungrouped. On: the AI makes a new named group for them.",
+    "conditions": [
+      { "if": { "property": "zen.tidy-tabs.auto-sort-new-tabs", "value": true } }
+    ]
+  },
+  {
+    "property": "zen.tidy-tabs.rules",
+    "label": "Always put these sites in these groups",
+    "type": "string",
+    "placeholder": "github.com/volumio => Volumio dev; booking.com => Travel",
+    "defaultValue": "",
+    "description": "One rule per line or separated by ';'. Left: part of the address. Right: group name. Rules win over the AI."
+  },
+  {
     "type": "separator",
     "label": "Group icons"
   },

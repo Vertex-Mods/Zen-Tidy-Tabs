@@ -33,6 +33,24 @@
     WORKSPACE_SUGGEST_MARGIN: 0.12, // Must beat current-workspace similarity by this much
     WORKSPACE_SUGGEST_MAX: 3, // Max suggestion rows per notification (avoids clutter)
     WORKSPACE_PROFILE_CACHE_LIMIT: 20,
+    // --- Auto-sort new tabs (opt-in) ---
+    AUTO_SORT_DEBOUNCE_MS: 1500, // Tabs that finish loading within this window share one embedding run
+    AUTO_SORT_PENDING_TTL_MS: 60000, // Forget a new tab that hasn't loaded a real page by then
+    AUTO_SORT_RETRY_MS: 2000, // Re-check interval while the broom sort is running
+    AUTO_SORT_MAX_BUSY_RETRIES: 10, // Past this many retries against a previous auto-sort batch, back off 3x (tabs stay queued, never dropped)
+    AUTO_SORT_BROOM_WAIT_MS: 15000, // Max time a broom click waits for an in-flight batch
+    AUTO_SORT_ARM_FALLBACK_MS: 10000, // Arm delay when SessionStore's restore promise is unavailable
+    // A single new tab rarely clears GROUP_SIMILARITY_THRESHOLD against a mixed
+    // group, so auto-sort also accepts a clear winner: best score at least
+    // MIN_SIMILARITY and ahead of the runner-up group by MIN_MARGIN. The floor
+    // is what keeps generic pages (sign-in, mail, maps, chat) out: on real
+    // groups they scored up to ~0.36, while genuine members scored ~0.5+.
+    // A space with a single group has no runner-up, so the floor alone decides.
+    // NOTE: 0.45 floor was calibrated on title-only embeddings. Since v2.0.1
+    // auto-sort embeds URL+title (title-only for non-web URLs), so it may need re-calibration.
+    AUTO_SORT_MIN_SIMILARITY: 0.45,
+    AUTO_SORT_MIN_MARGIN: 0.1,
+    // --- Site rules (opt-in) ---
   };
 
   // --- Ensure Firefox's local ML engine is enabled ---
@@ -53,6 +71,11 @@
   const AUTO_ICON_KEYWORDS_PREF = "zen.tidy-tabs.auto-icons-keywords";
   const WORKSPACE_SUGGEST_PREF = "zen.tidy-tabs.workspace-suggest";
   const WORKSPACE_NAME_ONLY_PREF = "zen.tidy-tabs.workspace-name-only";
+  const AUTO_SORT_PREF = "zen.tidy-tabs.auto-sort-new-tabs";
+  const AUTO_SORT_CREATE_GROUPS_PREF = "zen.tidy-tabs.auto-sort-create-groups";
+  const UNGROUPED_ON_TOP_PREF = "zen.tidy-tabs.ungrouped-on-top";
+  const CLOSE_DUPLICATES_PREF = "zen.tidy-tabs.close-duplicates";
+  const RULES_PREF = "zen.tidy-tabs.rules";
 
   // User-configurable minimum tab count for the sort button to appear.
   // The user can type any amount (including less than 6) in the mod settings.
@@ -150,6 +173,123 @@
     }
   };
 
+  // Auto-sort toggles. Both opt-in (default false); read on every step so
+  // switching them off takes effect immediately.
+  const getAutoSortEnabled = () => {
+    try {
+      if (typeof Services === "undefined" || !Services.prefs) return false;
+      try {
+        return Services.prefs.getBoolPref(AUTO_SORT_PREF, false);
+      } catch (_e) {
+        return false;
+      }
+    } catch (e) {
+      console.error("[TabSort] Error reading auto-sort pref:", e);
+      return false;
+    }
+  };
+
+  // Where loose tabs end up after a sort: below the groups (default, original
+  // behaviour) or above them.
+  const getUngroupedOnTopEnabled = () => {
+    try {
+      return Services.prefs.getBoolPref(UNGROUPED_ON_TOP_PREF, false);
+    } catch (_e) {
+      return false;
+    }
+  };
+
+  // Off by default: closing tabs is destructive, so the user opts in.
+  const getCloseDuplicatesEnabled = () => {
+    try {
+      return Services.prefs.getBoolPref(CLOSE_DUPLICATES_PREF, false);
+    } catch (_e) {
+      return false;
+    }
+  };
+
+  const getAutoSortCreateGroupsEnabled = () => {
+    try {
+      if (typeof Services === "undefined" || !Services.prefs) return false;
+      try {
+        return Services.prefs.getBoolPref(AUTO_SORT_CREATE_GROUPS_PREF, false);
+      } catch (_e) {
+        return false;
+      }
+    } catch (e) {
+      console.error("[TabSort] Error reading auto-sort create-groups pref:", e);
+      return false;
+    }
+  };
+
+  // --- Site rules (opt-in): "part-of-address => Group" lines ---
+  const getRulesText = () => {
+    try {
+      return Services.prefs.getStringPref(RULES_PREF, "");
+    } catch (_e) {
+      return "";
+    }
+  };
+
+  // Title (max 120 chars) + host/path of a tab. No query string or hash is
+  // ever used; non-http(s) tabs get an empty url.
+  const tabSiteText = (tab) => {
+    let title = "";
+    let url = "";
+    try {
+      title = String(getTabTitle(tab) || "").trim().slice(0, 120);
+    } catch (_e) {
+      /* ignore */
+    }
+    try {
+      const spec = tab?.linkedBrowser?.currentURI?.spec || "";
+      if (/^https?:/i.test(spec)) {
+        const u = new URL(spec);
+        url = u.host + u.pathname;
+      }
+    } catch (_e) {
+      /* ignore */
+    }
+    return { title, url };
+  };
+
+  // "pattern => Group name" rules, one per line or ';'-separated.
+  let rulesCache = { text: null, rules: [] };
+  const parseRules = (text) => {
+    const src = String(text ?? "");
+    if (rulesCache.text === src) return rulesCache.rules;
+    const rules = [];
+    for (const part of src.split(/[\n;]/)) {
+      const idx = part.indexOf("=>");
+      if (idx < 0) continue;
+      const pattern = part
+        .slice(0, idx)
+        .trim()
+        .toLowerCase()
+        .replace(/^[a-z]+:\/\//, "");
+      const group = part.slice(idx + 2).trim();
+      if (pattern && group) rules.push({ pattern, group });
+    }
+    rulesCache = { text: src, rules };
+    return rules;
+  };
+
+  // Group name of the first rule whose pattern is a substring of the tab's
+  // lowercased host + pathname, else null.
+  const matchRule = (tab) => {
+    try {
+      const rules = parseRules(getRulesText());
+      if (!rules.length) return null;
+      const { url } = tabSiteText(tab);
+      if (!url) return null;
+      const hay = url.toLowerCase();
+      for (const r of rules) if (hay.includes(r.pattern)) return r.group;
+    } catch (_e) {
+      /* ignore */
+    }
+    return null;
+  };
+
   const getTabIconURL = (tab) => {
     try {
       if (!tab?.isConnected) return "";
@@ -175,11 +315,14 @@
 
   // --- Globals & State ---
   let isSorting = false;
+  let broomWaiting = false; // broom click waiting for an in-flight auto-sort batch: tells it to stop
   let sortButtonListenerAdded = false;
   let isPlayingFailureAnimation = false;
   let sortAnimationId = null;
   let eventListenersAdded = false;
   let minTabsPrefObserver = null;
+  // In-flight auto-sort batch; the broom sort awaits it so clicks are never dropped.
+  let autoSortPromise = null;
 
   // DOM Cache for performance
   const domCache = {
@@ -416,10 +559,14 @@
     "about:blank",
   ]);
   const tabToEmbeddingText = (urlSpec, title = "") => {
-    const urlPart = urlToEmbeddingText(urlSpec, "");
+    // URL tokens only for real web hosts. For file:, localhost, about: etc.
+    // urlToEmbeddingText returns the raw URL, whose long shared prefix
+    // (same folder / same dev server) would dominate the text and make
+    // unrelated pages look alike — the title is the meaningful part there.
+    const urlPart = getTabHost(urlSpec) ? urlToEmbeddingText(urlSpec, "") : "";
     const t = String(title || "").trim().slice(0, 120);
     if (!t || GENERIC_TITLES.has(t.toLowerCase())) {
-      return urlPart || t.slice(0, 256);
+      return urlPart || urlToEmbeddingText(urlSpec, "") || t.slice(0, 256);
     }
     if (!urlPart) return t.slice(0, 256);
     // Skip title if it's just the bare domain restated (e.g. title
@@ -1147,28 +1294,21 @@
     }
   };
 
-  const askAIForMultipleTopics = async (tabs) => {
-    if (!Array.isArray(tabs) || tabs.length === 0) return [];
+  // --- Existing-group matching (shared by the broom sort and auto-sort) ---
+  // Both paths must use exactly the same strictness, so the logic lives here.
 
-    const validTabs = tabs.filter((tab) => tab?.isConnected);
-    if (!validTabs.length) return [];
-
-    const currentWorkspaceId = window.gZenWorkspaces?.activeWorkspace;
-    const result = [];
-    const ungroupedTabs = [];
-    // Reuse first-pass vectors for the clustering pass below — no re-inference.
-    const ungroupedEmbeddingsReuse = [];
-
-    // Get existing groups in current workspace
+  // Existing groups that hold tabs of a workspace, keyed by label:
+  // { element, tabs, tabUrlTexts, tabTitles, tabHosts }.
+  const collectWorkspaceGroups = (workspaceId) => {
     const existingWorkspaceGroups = new Map();
-    if (currentWorkspaceId) {
-      const groupSelector = `tab-group:has(tab[zen-workspace-id="${currentWorkspaceId}"])`;
+    if (workspaceId) {
+      const groupSelector = `tab-group:has(tab[zen-workspace-id="${workspaceId}"])`;
       document.querySelectorAll(groupSelector).forEach((groupEl) => {
         const label = groupEl.getAttribute("label");
         if (label) {
           // Get tabs in this group to calculate group embedding
           const groupTabs = Array.from(groupEl.querySelectorAll('tab')).filter(tab => 
-            tab.getAttribute("zen-workspace-id") === currentWorkspaceId
+            tab.getAttribute("zen-workspace-id") === workspaceId
           );
           if (groupTabs.length > 0) {
             existingWorkspaceGroups.set(label, {
@@ -1189,20 +1329,13 @@
         }
       });
     }
+    return existingWorkspaceGroups;
+  };
 
-    // URL + title inference with cache (single shared engine, no re-creation).
-    // Embedding input is tabToEmbeddingText() — domain affinity from URL,
-    // topic specificity from title. Same domain shares tokens (higher
-    // cosine), divergent titles/paths score distant. Titles also kept
-    // alongside for logs/naming.
-    const tabTitles = validTabs.map((tab) => getTabTitle(tab));
-    const tabUrlTexts = validTabs.map((tab, i) =>
-      tabToEmbeddingText(getTabUrlSpec(tab), tabTitles[i] || "")
-    );
-    const embeddings = await getEmbeddingsForTitles(tabUrlTexts);
-
-    // Calculate embeddings for existing workspace groups (cache-hit when
-    // URLs overlap with open tabs).
+  // Average URL+title embedding per group (cache-hit when URLs overlap with
+  // open tabs). Returns Map<label, vector>. Tab vectors compared against
+  // these must use the same text form: tabToEmbeddingText(url, title).
+  const embedWorkspaceGroups = async (existingWorkspaceGroups) => {
     const existingGroupEmbeddings = new Map();
     for (const [groupName, groupInfo] of existingWorkspaceGroups) {
       try {
@@ -1220,6 +1353,681 @@
         console.error(`[TabSort] Error calculating embedding for existing group "${groupName}":`, e);
       }
     }
+    return existingGroupEmbeddings;
+  };
+
+  // Best existing group for one tab, or null. Embedding cosine + existing-
+  // group boost + same-site boost (pure embedding match: upstream v2.0.1
+  // dropped the levenshtein title fallback). Tabs without an embedding
+  // never match.
+  const findBestExistingGroup = (
+    tab,
+    tabEmbedding,
+    existingWorkspaceGroups,
+    existingGroupEmbeddings
+  ) => {
+    if (!tabEmbedding) return null;
+
+    let bestMatch = null;
+    let bestSimilarity = 0;
+    let tabHost = "";
+    try {
+      tabHost = getTabHost(getTabUrlSpec(tab));
+    } catch (_e) {}
+
+    // Check against current workspace groups
+    for (const [groupName, groupInfo] of existingWorkspaceGroups) {
+      const groupEmbedding = existingGroupEmbeddings.get(groupName);
+      if (!groupEmbedding) continue;
+
+      let similarity = cosineSimilarity(tabEmbedding, groupEmbedding);
+      similarity += CONFIG.EXISTING_GROUP_BOOST; // Always boost existing groups
+      // Same-site affinity (issue #9): a tab sharing its bare host with
+      // any tab already in the group is near-always related (electrolux
+      // manuals vs appliances). Cross-domain pairs are unaffected, so the
+      // mis-merges that motivated the v2 tightening can't come back.
+      if (
+        tabHost &&
+        Array.isArray(groupInfo.tabHosts) &&
+        groupInfo.tabHosts.includes(tabHost)
+      ) {
+        similarity += CONFIG.SAME_HOST_BOOST;
+      }
+
+      if (similarity > CONFIG.GROUP_SIMILARITY_THRESHOLD && similarity > bestSimilarity) {
+        bestMatch = { 
+          groupName, 
+          similarity,
+          matchType: 'embedding'
+        };
+        bestSimilarity = similarity;
+      }
+    }
+
+    return bestMatch;
+  };
+
+  // Auto-sort only: the broom match first, then a looser "clear winner" rule
+  // on the same average group vectors (closest-tab scoring was tried and let
+  // unrelated tabs in through one loosely similar title).
+  const findAutoSortGroup = (
+    tab,
+    tabTitle,
+    tabEmbedding,
+    existingWorkspaceGroups,
+    existingGroupEmbeddings
+  ) => {
+    const strict = findBestExistingGroup(
+      tab,
+      tabEmbedding,
+      existingWorkspaceGroups,
+      existingGroupEmbeddings
+    );
+    if (strict || !tabEmbedding) return strict;
+
+    const scores = [];
+    for (const groupName of existingWorkspaceGroups.keys()) {
+      const avg = existingGroupEmbeddings.get(groupName);
+      if (avg) scores.push({ groupName, score: cosineSimilarity(tabEmbedding, avg) });
+    }
+    scores.sort((a, b) => b.score - a.score);
+    const [best, second] = scores;
+    if (!best) return null;
+    const margin = best.score - (second ? Math.max(second.score, 0) : 0);
+    console.log(
+      `[TabSort][Auto] "${tabTitle}" best "${best.groupName}" ${best.score.toFixed(3)}, margin ${margin.toFixed(3)}`
+    );
+    if (
+      best.score >= CONFIG.AUTO_SORT_MIN_SIMILARITY &&
+      margin >= CONFIG.AUTO_SORT_MIN_MARGIN
+    ) {
+      return { groupName: best.groupName, similarity: best.score, matchType: "auto" };
+    }
+    return null;
+  };
+
+  // Moves the loose tabs that sit below a space's first group up above it,
+  // keeping their order. Zen's empty and Glance tabs stay where they are.
+  const moveLooseTabsAboveGroups = (tabsContainer) => {
+    const children = Array.from(tabsContainer?.children || []);
+    const firstGroupIndex = children.findIndex(
+      (el) => el.tagName?.toLowerCase() === "tab-group"
+    );
+    if (firstGroupIndex === -1) return;
+    const looseTabs = children
+      .slice(firstGroupIndex + 1)
+      .filter(
+        (el) =>
+          el.tagName?.toLowerCase() === "tab" &&
+          !el.pinned &&
+          !el.hasAttribute("zen-empty-tab") &&
+          !el.hasAttribute("zen-glance-tab")
+      );
+    if (looseTabs.length === 0) return;
+    gBrowser.moveTabsBefore(looseTabs, children[firstGroupIndex]);
+    console.log(`[TabSort] Moved ${looseTabs.length} ungrouped tab(s) above the groups`);
+  };
+
+  // Same, for every space's tabs container in this window.
+  const moveLooseTabsAboveGroupsEverywhere = () => {
+    if (!getUngroupedOnTopEnabled()) return;
+    const containers = new Set();
+    document.querySelectorAll("tab-group").forEach((group) => {
+      if (group.parentNode) containers.add(group.parentNode);
+    });
+    for (const container of containers) {
+      try {
+        moveLooseTabsAboveGroups(container);
+      } catch (e) {
+        console.error("[TabSort] Error moving ungrouped tabs above groups:", e);
+      }
+    }
+  };
+
+  // Closes tabs open more than once (same exact URL) in a space, keeping one
+  // per URL. Closed tabs stay in recently-closed, so Cmd+Shift+T restores them.
+  const closeDuplicateTabs = (workspaceId) => {
+    try {
+      const byUrl = new Map();
+      for (const tab of gBrowser.tabs) {
+        if (
+          tab.getAttribute("zen-workspace-id") !== workspaceId ||
+          tab.pinned ||
+          tab.hasAttribute("zen-essential") ||
+          tab.hasAttribute("zen-empty-tab") ||
+          tab.hasAttribute("zen-glance-tab")
+        ) {
+          continue;
+        }
+        const url = tab.linkedBrowser?.currentURI?.spec;
+        if (!url || url === "about:blank") continue;
+        if (!byUrl.has(url)) byUrl.set(url, []);
+        byUrl.get(url).push(tab);
+      }
+
+      const toClose = [];
+      for (const tabs of byUrl.values()) {
+        if (tabs.length < 2) continue;
+        const keep =
+          tabs.find((t) => t === gBrowser.selectedTab) ||
+          tabs.find((t) => t.hasAttribute("soundplaying")) ||
+          tabs.find((t) => t.closest("tab-group")) ||
+          tabs[0];
+        for (const tab of tabs) {
+          if (tab !== keep && !tab.hasAttribute("soundplaying")) {
+            toClose.push(tab);
+          }
+        }
+      }
+      if (toClose.length === 0) return 0;
+
+      gBrowser.removeTabs(toClose, { animate: false });
+      console.log(`[TabSort] Closed ${toClose.length} duplicate tabs`);
+      return toClose.length;
+    } catch (e) {
+      console.error("[TabSort] Error closing duplicate tabs:", e);
+      return 0;
+    }
+  };
+
+  // Group naming (model-driven, no hardcoded topic lists).
+  // Improvements over the old title-only path:
+  // - inputs are cleaned (site suffixes stripped, deduped, generic
+  //   titles dropped) so "GitHub | GitHub | GitHub" doesn't force a
+  //   generic output;
+  // - if cleaned titles collapse to ~1 unique value, humanized URL
+  //   path tokens are appended so distinct topics on the same domain
+  //   still get distinct names (still via the topic model);
+  // - fallback is embedding-central (closest to centroid), not
+  //   titles[0], so no positional bias.
+  // Split repo/URL-style casings so names read naturally:
+  // "SavageWindRecomp" -> "Savage Wind Recomp",
+  // "BOTWRecompAndroid" -> "BOTW Recomp Android",
+  // "terax-ai" -> "terax ai". Generic rules, no word lists.
+  const humanizeSpacing = (s) => {
+    let out = String(s || "");
+    out = out
+      .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+      .replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2")
+      .replace(/[-_]+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    return out;
+  };
+
+  // Function words stay title-cased; other 2-letter words are
+  // assumed acronyms ("ai" -> "AI"). Generic English list, not topics.
+  const FUNCTION_WORDS_2 = new Set([
+    "of", "to", "in", "on", "at", "or", "as", "by", "an", "up",
+    "it", "is", "us", "we", "be", "do", "go", "no", "so", "my",
+    "me", "if", "he", "ex", "re", "ox",
+  ]);
+  // Preserve acronyms/caps the blanket toTitleCase destroyed
+  // ("AI" -> "Ai", "PS4" at risk). Generic, no word lists.
+  const smartCasing = (raw) => {
+    const s = String(raw || "").trim();
+    if (!s) return "";
+    if (s.length <= 4 && s.toUpperCase() === s && /[A-Z]/.test(s))
+      return s.toUpperCase();
+    return s
+      .split(/\s+/)
+      .map((w) => {
+        if (!w) return w;
+        const alnum = w.replace(/[^A-Za-z0-9]/g, "");
+        if (/[0-9]/.test(w) && /[A-Za-z]/.test(w) && alnum.length <= 5)
+          return w.toUpperCase(); // ps4 -> PS4, 7mb -> 7MB
+        if (/[0-9]/.test(w) && /[A-Z]/.test(w)) return w; // TOTK-PS4
+        if (/[A-Z]{2,}/.test(w)) return w; // BOTW, TOTK
+        const core = alnum;
+        if (
+          core.length <= 3 &&
+          core.toUpperCase() === core &&
+          /[A-Z]/.test(core)
+        )
+          return w.toUpperCase();
+        if (core.length === 2 && !FUNCTION_WORDS_2.has(core.toLowerCase()))
+          return w.toUpperCase(); // ai -> AI (but "of" stays "Of")
+        return w.charAt(0).toUpperCase() + w.slice(1).toLowerCase();
+      })
+      .join(" ");
+  };
+
+  // Fit a name to the label budget without mid-word cuts
+  // ("Underwater Dolphin Kicking" was sliced to "...Kicki").
+  const fitGroupName = (s, max = 28) => {
+    let t = String(s || "").trim();
+    if (t.length <= max) return t;
+    const cut = t.slice(0, max);
+    const lastSpace = cut.lastIndexOf(" ");
+    if (lastSpace >= 10) return cut.slice(0, lastSpace).trim();
+    return cut.trim();
+  };
+
+  // Strip only spaced suffix separators (" | ", " – ", " — ").
+  // Never bare "-" (it broke "AI-native" -> "AI", "Terminal-first" -> "Terminal").
+  // For "owner/repo: desc" shapes, prefer the repo segment (generic, no site lists).
+  // Repo-style casings are humanized: "SavageWindRecomp" -> "Savage Wind Recomp".
+  const baseNameForFallback = (s) => {
+    let base = String(s || "").trim();
+    base = base.split(/\s[|–—]\s|\s\|\s/)[0].trim();
+    if (base.includes("/")) {
+      const after = base.split("/").pop().trim();
+      if (after) base = after.split(":")[0].trim() || base;
+    }
+    return fitGroupName(
+      smartCasing(
+        humanizeSpacing(
+          base
+            .replace(/^['"`]+|['"`]+$/g, "")
+            .replace(/[.?!,:;]+$/, "")
+            .trim()
+        )
+      )
+    );
+  };
+
+  async function nameGroupBuiltin(
+    titles,
+    urlTexts = [],
+    groupVectors = [],
+    _retried = 0
+  ) {
+    const cleaned = (titles || [])
+      .map((t) => cleanTitleForNaming(t))
+      .map((s) => s.trim())
+      .filter(
+        (s) =>
+          s &&
+          s.toLowerCase() !== "untitled page" &&
+          s.toLowerCase() !== "new tab" &&
+          s.toLowerCase() !== "loading..."
+      );
+    const uniqueTitles = Array.from(new Set(cleaned));
+    // Diverse input sampling: first-6 hid breadth in 5+ tab groups
+    // (model saw 3 Zelda titles, still said "Game"). Rank tabs by
+    // centrality, feed top-3 central + 2 outliers + middle.
+    let modelTitles = uniqueTitles.slice(0, 6);
+    let groupCentroid = null;
+    try {
+      const validVecs = (groupVectors || []).filter(
+        (v) => Array.isArray(v) && v.length > 0
+      );
+      if (
+        validVecs.length > 0 &&
+        Array.isArray(titles) &&
+        titles.length === groupVectors.length &&
+        cleaned.length > 6
+      ) {
+        groupCentroid = averageEmbedding(validVecs);
+        const perTab = cleaned
+          .map((c, i) => {
+            const v = groupVectors[i];
+            if (!Array.isArray(v) || v.length === 0 || !c) return null;
+            return { c, s: cosineSimilarity(v, groupCentroid), i };
+          })
+          .filter(Boolean);
+        perTab.sort((a, b) => b.s - a.s);
+        const picks = [];
+        const pushU = (o) => {
+          if (o && !picks.includes(o.c)) picks.push(o.c);
+        };
+        perTab.slice(0, 3).forEach(pushU);
+        perTab.slice(-2).forEach(pushU);
+        if (perTab.length > 5)
+          pushU(perTab[Math.floor(perTab.length / 2)]);
+        for (const o of perTab) {
+          if (picks.length >= 6) break;
+          pushU(o);
+        }
+        if (picks.length > 0) modelTitles = picks.slice(0, 6);
+      } else if (validVecs.length > 0) {
+        groupCentroid = averageEmbedding(validVecs);
+      }
+    } catch (_e) {}
+
+    // URL context only when titles are indistinct — gives the small
+    // topic model something to differentiate same-domain groups.
+    let urlHint = [];
+    try {
+      const uniqUrls = Array.from(new Set((urlTexts || []).filter(Boolean)));
+      // Take path-ish tail tokens (after the shared domain prefix).
+      urlHint = uniqUrls
+        .map((u) => {
+          const toks = String(u).split(" ").slice(2, 6).join(" ").trim();
+          return toks;
+        })
+        .filter((s) => s && s.length >= 3)
+        .slice(0, 6);
+    } catch (_e) {}
+    const needHint = modelTitles.length <= 1 && urlHint.length > 0;
+    const inputLines = needHint
+      ? modelTitles.concat(urlHint).slice(0, 8)
+      : modelTitles.slice(0, 6);
+    const input = inputLines.join("\n").slice(0, 1000);
+
+    const centroidFallback = () => {
+      try {
+        if (
+          Array.isArray(groupVectors) &&
+          groupVectors.length > 0 &&
+          Array.isArray(titles) &&
+          titles.length === groupVectors.length
+        ) {
+          const centroid = groupCentroid || averageEmbedding(groupVectors.filter((v) => Array.isArray(v) && v.length > 0));
+          let bestIdx = 0;
+          let bestScore = -Infinity;
+          for (let k = 0; k < groupVectors.length; k++) {
+            const v = groupVectors[k];
+            if (!Array.isArray(v) || v.length === 0) continue;
+            const s = cosineSimilarity(v, centroid);
+            if (s > bestScore) {
+              bestScore = s;
+              bestIdx = k;
+            }
+          }
+          const pick = cleanTitleForNaming(titles[bestIdx] || "") || "";
+          const fb = baseNameForFallback(pick);
+          if (fb && fb.length >= 3) return fb;
+        }
+      } catch (_e) {}
+      // Last resort: first usable cleaned title, else "Group".
+      const fb = baseNameForFallback(modelTitles[0] || uniqueTitles[0] || cleaned[0] || "");
+      return fb || "Group";
+    };
+
+    // If we have no signal at all, skip inference.
+    if (inputLines.length === 0) return centroidFallback();
+
+    try {
+      const knownNamer = namerEnginePromise;
+      const engine = await withEngineTimeout(
+        getNamerEngine(),
+        CONFIG.ENGINE_RUN_TIMEOUT_MS,
+        "namer-engine-ready"
+      );
+
+      let aiResult;
+      try {
+        aiResult = await enqueueNamerRun(() =>
+          engine.run({
+            args: [input],
+            // 12 tokens allows 2-3 word specific names ("Underwater
+            // Dolphin Kicks"); 0.5 temp is more input-faithful than 0.7.
+            options: { max_new_tokens: 12, temperature: 0.5 },
+          })
+        );
+      } catch (runErr) {
+        invalidateNamerEngine(knownNamer);
+        throw runErr;
+      }
+
+      const raw = aiResult?.[0]?.generated_text;
+      let name = String(raw || "")
+        .split("\n")
+        .map((l) => l.trim())
+        .find((l) => l);
+
+      console.log(
+        `[TabSort][AI] Topic model raw output for [${inputLines.slice(0, 3).join(" | ")}]:`,
+        JSON.stringify(raw ?? null)
+      );
+
+      name = smartCasing(humanizeSpacing(name));
+      if (
+        !name ||
+        /^(group|groups|untitled|new tab|home|homepage|search|website)?$|none|adult content|unknown/i.test(
+          name
+        )
+      ) {
+        console.log(
+          `[TabSort][AI] Topic model gave unusable name (${JSON.stringify(name)}), using centroid fallback`
+        );
+        return centroidFallback();
+      }
+
+      name = fitGroupName(
+        name
+          .replace(/^['"`]+|['"`]+$/g, "")
+          .replace(/[.?!,:;]+$/, "")
+          .trim()
+      );
+      if (!name) return centroidFallback();
+
+      // Redundancy: "Photon Photo" — two words sharing a stem where
+      // only one occurs in the inputs. Fall back (yields the actual
+      // product name, e.g. "Photon Browser").
+      try {
+        const rw = name.split(/\s+/).filter((w) => w.length > 2);
+        if (rw.length === 2) {
+          const a = rw[0].toLowerCase();
+          const b = rw[1].toLowerCase();
+          let prefix = 0;
+          while (
+            prefix < Math.min(a.length, b.length) &&
+            a[prefix] === b[prefix]
+          )
+            prefix++;
+          if (prefix >= 4) {
+            const toks = inputLines
+              .join("\n")
+              .toLowerCase()
+              .split(/[^a-z0-9]+/);
+            if (toks.includes(a) !== toks.includes(b)) {
+              console.log(
+                `[TabSort][AI] Name "${name}" redundant (shared stem, only one in inputs), using centroid fallback`
+              );
+              return centroidFallback();
+            }
+          }
+        }
+      } catch (_e) {}
+
+      // Lexical grounding: at least one content word in the name must
+      // occur in the inputs (exact or trailing-s plural). Rejects
+      // pure inventions ("Game" for Zelda titles with no "game"
+      // token, "Photo" for Photon titles) while keeping valid
+      // abstractions ("Sports News" where "sports" appears).
+      try {
+        const STOP = new Set(["the", "and", "for", "with", "from", "into", "your", "you", "are"]);
+        const norm = (w) => String(w || "").toLowerCase();
+        const nameWords = norm(name).split(/[^a-z0-9]+/).filter((w) => w.length > 2 && !STOP.has(w));
+        if (nameWords.length > 0) {
+          const inputTokenSet = new Set(
+            inputLines.join("\n").toLowerCase().split(/[^a-z0-9]+/).filter((w) => w.length > 2)
+          );
+          const grounded = (w) =>
+            inputTokenSet.has(w) ||
+            inputTokenSet.has(`${w}s`) ||
+            (w.endsWith("s") && inputTokenSet.has(w.slice(0, -1)));
+          const ungrounded = nameWords.filter((w) => !grounded(w));
+          if (ungrounded.length === nameWords.length) {
+            console.log(
+              `[TabSort][AI] Name "${name}" ungrounded (none of ${nameWords.join(",")} in inputs), using centroid fallback`
+            );
+            return centroidFallback();
+          }
+        }
+      } catch (_e) {}
+
+      // Anti-truncation (issue #9: group named "aacomo" for an
+      // online-presence group about "giaaaacomo"): the small topic
+      // model sometimes emits a clipped substring of a real title
+      // token. A single-word name that matches NO input token exactly
+      // but sits inside a longer input token (or 1-2 edits away from
+      // one) is a clipping, not an abstraction — fall back to the
+      // centroid title text, which is always a real page title.
+      // Valid short forms ("AI", "PS4") are length<=3 and exempt.
+      try {
+        const STOP2 = new Set(["the", "and", "for", "with", "from", "into", "your", "you", "are"]);
+        const nw = String(name || "")
+          .toLowerCase()
+          .split(/[^a-z0-9]+/)
+          .filter((w) => w.length > 2 && !STOP2.has(w));
+        if (nw.length === 1 && nw[0].length >= 4) {
+          const word = nw[0];
+          const inputToks = inputLines
+            .join("\n")
+            .toLowerCase()
+            .split(/[^a-z0-9]+/)
+            .filter((w) => w.length >= 4);
+          const inputSet = new Set(inputToks);
+          const exact =
+            inputSet.has(word) ||
+            inputSet.has(`${word}s`) ||
+            (word.endsWith("s") && inputSet.has(word.slice(0, -1)));
+          if (!exact) {
+            let clipped = false;
+            for (const tok of inputSet) {
+              if (tok === word) continue;
+              // Substring either way with a clear length gap, or a
+              // near-miss edit on a longer token: "aacomo" in
+              // "giaaaacomo", "autodek" vs "autodesk".
+              if (
+                (tok.length >= word.length + 2 &&
+                  (tok.includes(word) || word.includes(tok))) ||
+                (tok.length >= word.length + 1 &&
+                  levenshteinDistance(word, tok) <= 2)
+              ) {
+                clipped = true;
+                break;
+              }
+            }
+            if (clipped) {
+              console.log(
+                `[TabSort][AI] Name "${name}" looks like a clipped input token, using centroid fallback`
+              );
+              return centroidFallback();
+            }
+          }
+        }
+      } catch (_e) {}
+
+      // Embedding check: name must sit near the group centroid.
+      // Bar raised 0.3 -> 0.35 (issue #9): truncated/hallucinated
+      // names ("aacomo", "Game" for Zelda titles) embed away from
+      // the centroid and must fall back to real title text.
+      try {
+        if (groupCentroid) {
+          const [nameVec] = await getEmbeddingsForTitles([name], 1);
+          if (nameVec) {
+            const sim = cosineSimilarity(nameVec, groupCentroid);
+            console.log(`[TabSort][AI] Name "${name}" vs centroid: ${sim.toFixed(3)}`);
+            if (sim < 0.35) {
+              console.log(
+                `[TabSort][AI] Name "${name}" too far from group, using centroid fallback`
+              );
+              return centroidFallback();
+            }
+          }
+        }
+      } catch (_e) {}
+      return name;
+    } catch (e) {
+      console.error("[TabSort][AI] Error naming group:", e);
+      // Dead port / crashed inference process: drop the singleton
+      // and retry with backoff, mirroring embedTexts.
+      invalidateNamerEngine();
+      if (isDeadPortError(e) && _retried < 2) {
+        console.log(
+          `[TabSort][AI] Retrying group naming with a fresh engine (attempt ${_retried + 2}/3)...`
+        );
+        await sleepMs(800 * (_retried + 1));
+        try {
+          return await nameGroupBuiltin(
+            titles,
+            urlTexts,
+            groupVectors,
+            _retried + 1
+          );
+        } catch (retryErr) {
+          console.error("[TabSort][AI] Naming retry failed:", retryErr);
+        }
+      }
+      return centroidFallback();
+    }
+  }
+
+  // Group name for a set of tabs (built-in smart-tab-topic namer).
+  // urlTexts / groupVectors are optional (URL hints + centroid fallback).
+  async function nameGroupWithSmartTabTopic(
+    titles,
+    urlTexts = [],
+    groupVectors = []
+  ) {
+    return nameGroupBuiltin(titles, urlTexts, groupVectors);
+  }
+
+  // Broom sort entry point: site rules first, then the built-in embedding
+  // path below. Returns [{ tab, topic }] like the built-in path.
+  const askAIForMultipleTopics = async (tabs) => {
+    if (!Array.isArray(tabs) || tabs.length === 0) return [];
+    const hasRules = parseRules(getRulesText()).length > 0;
+    if (!hasRules) return askAIForMultipleTopicsBuiltin(tabs);
+
+    const validTabs = tabs.filter((tab) => tab?.isConnected);
+    if (!validTabs.length) return [];
+    const wsId = window.gZenWorkspaces?.activeWorkspace;
+    const groups = collectWorkspaceGroups(wsId);
+    const labelByLower = new Map(
+      Array.from(groups.keys()).map((l) => [l.toLowerCase(), l])
+    );
+    const result = [];
+
+    // Site rules (exempt from the >= 2 tabs rule). Existing group of the
+    // same name wins; otherwise the rule's name, created by the caller.
+    const rest = [];
+    for (const tab of validTabs) {
+      const rule = hasRules ? matchRule(tab) : null;
+      if (!rule) {
+        rest.push(tab);
+        continue;
+      }
+      const topic = labelByLower.get(rule.toLowerCase()) || rule;
+      if (!labelByLower.has(topic.toLowerCase())) {
+        labelByLower.set(topic.toLowerCase(), topic);
+      }
+      result.push({ tab, topic });
+    }
+    if (result.length) {
+      console.log(`[TabSort] ${result.length} tab(s) filed by site rules`);
+    }
+    if (!rest.length) return result;
+
+    // Built-in embedding path for the non-rule tabs.
+    return result.concat(await askAIForMultipleTopicsBuiltin(rest));
+  };
+
+  const askAIForMultipleTopicsBuiltin = async (tabs) => {
+    if (!Array.isArray(tabs) || tabs.length === 0) return [];
+
+    const validTabs = tabs.filter((tab) => tab?.isConnected);
+    if (!validTabs.length) return [];
+
+    const currentWorkspaceId = window.gZenWorkspaces?.activeWorkspace;
+    const result = [];
+    const ungroupedTabs = [];
+    // Reuse first-pass vectors for the clustering pass below — no re-inference.
+    const ungroupedEmbeddingsReuse = [];
+
+    // Get existing groups in current workspace
+    const existingWorkspaceGroups = collectWorkspaceGroups(currentWorkspaceId);
+
+    // URL + title inference with cache (single shared engine, no re-creation).
+    // Embedding input is tabToEmbeddingText() — domain affinity from URL,
+    // topic specificity from title. Same domain shares tokens (higher
+    // cosine), divergent titles/paths score distant. Titles also kept
+    // alongside for logs/naming.
+    const tabTitles = validTabs.map((tab) => getTabTitle(tab));
+    const tabUrlTexts = validTabs.map((tab, i) =>
+      tabToEmbeddingText(getTabUrlSpec(tab), tabTitles[i] || "")
+    );
+    const embeddings = await getEmbeddingsForTitles(tabUrlTexts);
+
+    // Calculate embeddings for existing workspace groups (cache-hit when
+    // URLs overlap with open tabs).
+    const existingGroupEmbeddings = await embedWorkspaceGroups(
+      existingWorkspaceGroups
+    );
 
     // Enhanced matching: try to match tabs to existing groups
     for (let i = 0; i < validTabs.length; i++) {
@@ -1233,49 +2041,17 @@
         continue;
       }
 
-      let bestMatch = null;
-      let bestSimilarity = 0;
-
-      // Check against current workspace groups
-      for (const [groupName, groupInfo] of existingWorkspaceGroups) {
-        const groupEmbedding = existingGroupEmbeddings.get(groupName);
-        if (!groupEmbedding) continue;
-
-        let similarity = cosineSimilarity(tabEmbedding, groupEmbedding);
-        similarity += CONFIG.EXISTING_GROUP_BOOST; // Always boost existing groups
-        // Same-site affinity (issue #9): a tab sharing its bare host with
-        // any tab already in the group is near-always related (electrolux
-        // manuals vs appliances). Cross-domain pairs are unaffected, so the
-        // mis-merges that motivated the v2 tightening can't come back.
-        try {
-          const tabHost = getTabHost(getTabUrlSpec(tab));
-          if (
-            tabHost &&
-            Array.isArray(groupInfo.tabHosts) &&
-            groupInfo.tabHosts.includes(tabHost)
-          ) {
-            similarity += CONFIG.SAME_HOST_BOOST;
-          }
-        } catch (_e) {}
-
-        if (similarity > CONFIG.GROUP_SIMILARITY_THRESHOLD && similarity > bestSimilarity) {
-          bestMatch = { 
-            groupData: { groupName }, 
-            similarity,
-            isExistingGroup: true
-          };
-          bestSimilarity = similarity;
-        }
-      }
-
-      // Pure embedding match only — removed legacy Levenshtein title
-      // fallback so all grouping stays in the embedding model (no hardcoded
-      // string rules). URL texts already encode domain similarity.
+      const bestMatch = findBestExistingGroup(
+        tab,
+        tabEmbedding,
+        existingWorkspaceGroups,
+        existingGroupEmbeddings
+      );
 
       if (bestMatch) {
         // Add tab to existing group
-        result.push({ tab, topic: bestMatch.groupData.groupName });
-        console.log(`[TabSort] Matched "${tabTitle}" [${tabUrlTexts[i]}] to existing group "${bestMatch.groupData.groupName}" (similarity: ${bestMatch.similarity.toFixed(3)}, url-embedding)`);
+        result.push({ tab, topic: bestMatch.groupName });
+        console.log(`[TabSort] Matched "${tabTitle}" [${tabUrlTexts[i]}] to existing group "${bestMatch.groupName}" (similarity: ${bestMatch.similarity.toFixed(3)}, url-embedding)`);
       } else {
         ungroupedTabs.push(tab);
         ungroupedEmbeddingsReuse.push(tabEmbedding);
@@ -1548,423 +2324,6 @@
               .map(([word]) => word);
 
             return keywords;
-          }
-
-          // Group naming (model-driven, no hardcoded topic lists).
-          // Improvements over the old title-only path:
-          // - inputs are cleaned (site suffixes stripped, deduped, generic
-          //   titles dropped) so "GitHub | GitHub | GitHub" doesn't force a
-          //   generic output;
-          // - if cleaned titles collapse to ~1 unique value, humanized URL
-          //   path tokens are appended so distinct topics on the same domain
-          //   still get distinct names (still via the topic model);
-          // - fallback is embedding-central (closest to centroid), not
-          //   titles[0], so no positional bias.
-          // Split repo/URL-style casings so names read naturally:
-          // "SavageWindRecomp" -> "Savage Wind Recomp",
-          // "BOTWRecompAndroid" -> "BOTW Recomp Android",
-          // "terax-ai" -> "terax ai". Generic rules, no word lists.
-          const humanizeSpacing = (s) => {
-            let out = String(s || "");
-            out = out
-              .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
-              .replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2")
-              .replace(/[-_]+/g, " ")
-              .replace(/\s+/g, " ")
-              .trim();
-            return out;
-          };
-
-          // Function words stay title-cased; other 2-letter words are
-          // assumed acronyms ("ai" -> "AI"). Generic English list, not topics.
-          const FUNCTION_WORDS_2 = new Set([
-            "of", "to", "in", "on", "at", "or", "as", "by", "an", "up",
-            "it", "is", "us", "we", "be", "do", "go", "no", "so", "my",
-            "me", "if", "he", "ex", "re", "ox",
-          ]);
-          // Preserve acronyms/caps the blanket toTitleCase destroyed
-          // ("AI" -> "Ai", "PS4" at risk). Generic, no word lists.
-          const smartCasing = (raw) => {
-            const s = String(raw || "").trim();
-            if (!s) return "";
-            if (s.length <= 4 && s.toUpperCase() === s && /[A-Z]/.test(s))
-              return s.toUpperCase();
-            return s
-              .split(/\s+/)
-              .map((w) => {
-                if (!w) return w;
-                const alnum = w.replace(/[^A-Za-z0-9]/g, "");
-                if (/[0-9]/.test(w) && /[A-Za-z]/.test(w) && alnum.length <= 5)
-                  return w.toUpperCase(); // ps4 -> PS4, 7mb -> 7MB
-                if (/[0-9]/.test(w) && /[A-Z]/.test(w)) return w; // TOTK-PS4
-                if (/[A-Z]{2,}/.test(w)) return w; // BOTW, TOTK
-                const core = alnum;
-                if (
-                  core.length <= 3 &&
-                  core.toUpperCase() === core &&
-                  /[A-Z]/.test(core)
-                )
-                  return w.toUpperCase();
-                if (core.length === 2 && !FUNCTION_WORDS_2.has(core.toLowerCase()))
-                  return w.toUpperCase(); // ai -> AI (but "of" stays "Of")
-                return w.charAt(0).toUpperCase() + w.slice(1).toLowerCase();
-              })
-              .join(" ");
-          };
-
-          // Fit a name to the label budget without mid-word cuts
-          // ("Underwater Dolphin Kicking" was sliced to "...Kicki").
-          const fitGroupName = (s, max = 28) => {
-            let t = String(s || "").trim();
-            if (t.length <= max) return t;
-            const cut = t.slice(0, max);
-            const lastSpace = cut.lastIndexOf(" ");
-            if (lastSpace >= 10) return cut.slice(0, lastSpace).trim();
-            return cut.trim();
-          };
-
-          // Strip only spaced suffix separators (" | ", " – ", " — ").
-          // Never bare "-" (it broke "AI-native" -> "AI", "Terminal-first" -> "Terminal").
-          // For "owner/repo: desc" shapes, prefer the repo segment (generic, no site lists).
-          // Repo-style casings are humanized: "SavageWindRecomp" -> "Savage Wind Recomp".
-          const baseNameForFallback = (s) => {
-            let base = String(s || "").trim();
-            base = base.split(/\s[|–—]\s|\s\|\s/)[0].trim();
-            if (base.includes("/")) {
-              const after = base.split("/").pop().trim();
-              if (after) base = after.split(":")[0].trim() || base;
-            }
-            return fitGroupName(
-              smartCasing(
-                humanizeSpacing(
-                  base
-                    .replace(/^['"`]+|['"`]+$/g, "")
-                    .replace(/[.?!,:;]+$/, "")
-                    .trim()
-                )
-              )
-            );
-          };
-
-          async function nameGroupWithSmartTabTopic(
-            titles,
-            urlTexts = [],
-            groupVectors = [],
-            _retried = 0
-          ) {
-            const cleaned = (titles || [])
-              .map((t) => cleanTitleForNaming(t))
-              .map((s) => s.trim())
-              .filter(
-                (s) =>
-                  s &&
-                  s.toLowerCase() !== "untitled page" &&
-                  s.toLowerCase() !== "new tab" &&
-                  s.toLowerCase() !== "loading..."
-              );
-            const uniqueTitles = Array.from(new Set(cleaned));
-            // Diverse input sampling: first-6 hid breadth in 5+ tab groups
-            // (model saw 3 Zelda titles, still said "Game"). Rank tabs by
-            // centrality, feed top-3 central + 2 outliers + middle.
-            let modelTitles = uniqueTitles.slice(0, 6);
-            let groupCentroid = null;
-            try {
-              const validVecs = (groupVectors || []).filter(
-                (v) => Array.isArray(v) && v.length > 0
-              );
-              if (
-                validVecs.length > 0 &&
-                Array.isArray(titles) &&
-                titles.length === groupVectors.length &&
-                cleaned.length > 6
-              ) {
-                groupCentroid = averageEmbedding(validVecs);
-                const perTab = cleaned
-                  .map((c, i) => {
-                    const v = groupVectors[i];
-                    if (!Array.isArray(v) || v.length === 0 || !c) return null;
-                    return { c, s: cosineSimilarity(v, groupCentroid), i };
-                  })
-                  .filter(Boolean);
-                perTab.sort((a, b) => b.s - a.s);
-                const picks = [];
-                const pushU = (o) => {
-                  if (o && !picks.includes(o.c)) picks.push(o.c);
-                };
-                perTab.slice(0, 3).forEach(pushU);
-                perTab.slice(-2).forEach(pushU);
-                if (perTab.length > 5)
-                  pushU(perTab[Math.floor(perTab.length / 2)]);
-                for (const o of perTab) {
-                  if (picks.length >= 6) break;
-                  pushU(o);
-                }
-                if (picks.length > 0) modelTitles = picks.slice(0, 6);
-              } else if (validVecs.length > 0) {
-                groupCentroid = averageEmbedding(validVecs);
-              }
-            } catch (_e) {}
-
-            // URL context only when titles are indistinct — gives the small
-            // topic model something to differentiate same-domain groups.
-            let urlHint = [];
-            try {
-              const uniqUrls = Array.from(new Set((urlTexts || []).filter(Boolean)));
-              // Take path-ish tail tokens (after the shared domain prefix).
-              urlHint = uniqUrls
-                .map((u) => {
-                  const toks = String(u).split(" ").slice(2, 6).join(" ").trim();
-                  return toks;
-                })
-                .filter((s) => s && s.length >= 3)
-                .slice(0, 6);
-            } catch (_e) {}
-            const needHint = modelTitles.length <= 1 && urlHint.length > 0;
-            const inputLines = needHint
-              ? modelTitles.concat(urlHint).slice(0, 8)
-              : modelTitles.slice(0, 6);
-            const input = inputLines.join("\n").slice(0, 1000);
-
-            const centroidFallback = () => {
-              try {
-                if (
-                  Array.isArray(groupVectors) &&
-                  groupVectors.length > 0 &&
-                  Array.isArray(titles) &&
-                  titles.length === groupVectors.length
-                ) {
-                  const centroid = groupCentroid || averageEmbedding(groupVectors.filter((v) => Array.isArray(v) && v.length > 0));
-                  let bestIdx = 0;
-                  let bestScore = -Infinity;
-                  for (let k = 0; k < groupVectors.length; k++) {
-                    const v = groupVectors[k];
-                    if (!Array.isArray(v) || v.length === 0) continue;
-                    const s = cosineSimilarity(v, centroid);
-                    if (s > bestScore) {
-                      bestScore = s;
-                      bestIdx = k;
-                    }
-                  }
-                  const pick = cleanTitleForNaming(titles[bestIdx] || "") || "";
-                  const fb = baseNameForFallback(pick);
-                  if (fb && fb.length >= 3) return fb;
-                }
-              } catch (_e) {}
-              // Last resort: first usable cleaned title, else "Group".
-              const fb = baseNameForFallback(modelTitles[0] || uniqueTitles[0] || cleaned[0] || "");
-              return fb || "Group";
-            };
-
-            // If we have no signal at all, skip inference.
-            if (inputLines.length === 0) return centroidFallback();
-
-            try {
-              const knownNamer = namerEnginePromise;
-              const engine = await withEngineTimeout(
-                getNamerEngine(),
-                CONFIG.ENGINE_RUN_TIMEOUT_MS,
-                "namer-engine-ready"
-              );
-
-              let aiResult;
-              try {
-                aiResult = await enqueueNamerRun(() =>
-                  engine.run({
-                    args: [input],
-                    // 12 tokens allows 2-3 word specific names ("Underwater
-                    // Dolphin Kicks"); 0.5 temp is more input-faithful than 0.7.
-                    options: { max_new_tokens: 12, temperature: 0.5 },
-                  })
-                );
-              } catch (runErr) {
-                invalidateNamerEngine(knownNamer);
-                throw runErr;
-              }
-
-              const raw = aiResult?.[0]?.generated_text;
-              let name = String(raw || "")
-                .split("\n")
-                .map((l) => l.trim())
-                .find((l) => l);
-
-              console.log(
-                `[TabSort][AI] Topic model raw output for [${inputLines.slice(0, 3).join(" | ")}]:`,
-                JSON.stringify(raw ?? null)
-              );
-
-              name = smartCasing(humanizeSpacing(name));
-              if (
-                !name ||
-                /^(group|groups|untitled|new tab|home|homepage|search|website)?$|none|adult content|unknown/i.test(
-                  name
-                )
-              ) {
-                console.log(
-                  `[TabSort][AI] Topic model gave unusable name (${JSON.stringify(name)}), using centroid fallback`
-                );
-                return centroidFallback();
-              }
-
-              name = fitGroupName(
-                name
-                  .replace(/^['"`]+|['"`]+$/g, "")
-                  .replace(/[.?!,:;]+$/, "")
-                  .trim()
-              );
-              if (!name) return centroidFallback();
-
-              // Redundancy: "Photon Photo" — two words sharing a stem where
-              // only one occurs in the inputs. Fall back (yields the actual
-              // product name, e.g. "Photon Browser").
-              try {
-                const rw = name.split(/\s+/).filter((w) => w.length > 2);
-                if (rw.length === 2) {
-                  const a = rw[0].toLowerCase();
-                  const b = rw[1].toLowerCase();
-                  let prefix = 0;
-                  while (
-                    prefix < Math.min(a.length, b.length) &&
-                    a[prefix] === b[prefix]
-                  )
-                    prefix++;
-                  if (prefix >= 4) {
-                    const toks = inputLines
-                      .join("\n")
-                      .toLowerCase()
-                      .split(/[^a-z0-9]+/);
-                    if (toks.includes(a) !== toks.includes(b)) {
-                      console.log(
-                        `[TabSort][AI] Name "${name}" redundant (shared stem, only one in inputs), using centroid fallback`
-                      );
-                      return centroidFallback();
-                    }
-                  }
-                }
-              } catch (_e) {}
-
-              // Lexical grounding: at least one content word in the name must
-              // occur in the inputs (exact or trailing-s plural). Rejects
-              // pure inventions ("Game" for Zelda titles with no "game"
-              // token, "Photo" for Photon titles) while keeping valid
-              // abstractions ("Sports News" where "sports" appears).
-              try {
-                const STOP = new Set(["the", "and", "for", "with", "from", "into", "your", "you", "are"]);
-                const norm = (w) => String(w || "").toLowerCase();
-                const nameWords = norm(name).split(/[^a-z0-9]+/).filter((w) => w.length > 2 && !STOP.has(w));
-                if (nameWords.length > 0) {
-                  const inputTokenSet = new Set(
-                    inputLines.join("\n").toLowerCase().split(/[^a-z0-9]+/).filter((w) => w.length > 2)
-                  );
-                  const grounded = (w) =>
-                    inputTokenSet.has(w) ||
-                    inputTokenSet.has(`${w}s`) ||
-                    (w.endsWith("s") && inputTokenSet.has(w.slice(0, -1)));
-                  const ungrounded = nameWords.filter((w) => !grounded(w));
-                  if (ungrounded.length === nameWords.length) {
-                    console.log(
-                      `[TabSort][AI] Name "${name}" ungrounded (none of ${nameWords.join(",")} in inputs), using centroid fallback`
-                    );
-                    return centroidFallback();
-                  }
-                }
-              } catch (_e) {}
-
-              // Anti-truncation (issue #9: group named "aacomo" for an
-              // online-presence group about "giaaaacomo"): the small topic
-              // model sometimes emits a clipped substring of a real title
-              // token. A single-word name that matches NO input token exactly
-              // but sits inside a longer input token (or 1-2 edits away from
-              // one) is a clipping, not an abstraction — fall back to the
-              // centroid title text, which is always a real page title.
-              // Valid short forms ("AI", "PS4") are length<=3 and exempt.
-              try {
-                const STOP2 = new Set(["the", "and", "for", "with", "from", "into", "your", "you", "are"]);
-                const nw = String(name || "")
-                  .toLowerCase()
-                  .split(/[^a-z0-9]+/)
-                  .filter((w) => w.length > 2 && !STOP2.has(w));
-                if (nw.length === 1 && nw[0].length >= 4) {
-                  const word = nw[0];
-                  const inputToks = inputLines
-                    .join("\n")
-                    .toLowerCase()
-                    .split(/[^a-z0-9]+/)
-                    .filter((w) => w.length >= 4);
-                  const inputSet = new Set(inputToks);
-                  const exact =
-                    inputSet.has(word) ||
-                    inputSet.has(`${word}s`) ||
-                    (word.endsWith("s") && inputSet.has(word.slice(0, -1)));
-                  if (!exact) {
-                    let clipped = false;
-                    for (const tok of inputSet) {
-                      if (tok === word) continue;
-                      // Substring either way with a clear length gap, or a
-                      // near-miss edit on a longer token: "aacomo" in
-                      // "giaaaacomo", "autodek" vs "autodesk".
-                      if (
-                        (tok.length >= word.length + 2 &&
-                          (tok.includes(word) || word.includes(tok))) ||
-                        (tok.length >= word.length + 1 &&
-                          levenshteinDistance(word, tok) <= 2)
-                      ) {
-                        clipped = true;
-                        break;
-                      }
-                    }
-                    if (clipped) {
-                      console.log(
-                        `[TabSort][AI] Name "${name}" looks like a clipped input token, using centroid fallback`
-                      );
-                      return centroidFallback();
-                    }
-                  }
-                }
-              } catch (_e) {}
-
-              // Embedding check: name must sit near the group centroid.
-              // Bar raised 0.3 -> 0.35 (issue #9): truncated/hallucinated
-              // names ("aacomo", "Game" for Zelda titles) embed away from
-              // the centroid and must fall back to real title text.
-              try {
-                if (groupCentroid) {
-                  const [nameVec] = await getEmbeddingsForTitles([name], 1);
-                  if (nameVec) {
-                    const sim = cosineSimilarity(nameVec, groupCentroid);
-                    console.log(`[TabSort][AI] Name "${name}" vs centroid: ${sim.toFixed(3)}`);
-                    if (sim < 0.35) {
-                      console.log(
-                        `[TabSort][AI] Name "${name}" too far from group, using centroid fallback`
-                      );
-                      return centroidFallback();
-                    }
-                  }
-                }
-              } catch (_e) {}
-              return name;
-            } catch (e) {
-              console.error("[TabSort][AI] Error naming group:", e);
-              // Dead port / crashed inference process: drop the singleton
-              // and retry with backoff, mirroring embedTexts.
-              invalidateNamerEngine();
-              if (isDeadPortError(e) && _retried < 2) {
-                console.log(
-                  `[TabSort][AI] Retrying group naming with a fresh engine (attempt ${_retried + 2}/3)...`
-                );
-                await sleepMs(800 * (_retried + 1));
-                try {
-                  return await nameGroupWithSmartTabTopic(
-                    titles,
-                    urlTexts,
-                    groupVectors,
-                    _retried + 1
-                  );
-                } catch (retryErr) {
-                  console.error("[TabSort][AI] Naming retry failed:", retryErr);
-                }
-              }
-              return centroidFallback();
-            }
           }
 
           // Process each new group
@@ -3267,6 +3626,19 @@
 
   // --- Main Sorting Function ---
   const sortTabsByTopic = async () => {
+    // Let an in-flight auto-sort batch finish first, so a click is never
+    // silently ignored and both never move the same tabs at once.
+    // Bounded, so a hung batch can't block the broom forever.
+    if (autoSortPromise) {
+      broomWaiting = true;
+      try {
+        await Promise.race([
+          autoSortPromise,
+          sleepMs(CONFIG.AUTO_SORT_BROOM_WAIT_MS),
+        ]);
+      } catch (_e) {}
+      broomWaiting = false;
+    }
     if (isSorting) return;
     isSorting = true;
     // Stop idle warmup inference so it can't run concurrently with the
@@ -3295,6 +3667,17 @@
         console.error("Cannot get current workspace ID.");
         showTidyToast("Nothing to tidy!", "error");
         return; // Exit early
+      }
+
+      let closedDuplicates = 0;
+      if (getCloseDuplicatesEnabled()) {
+        closedDuplicates = closeDuplicateTabs(currentWorkspaceId);
+        if (closedDuplicates > 0) {
+          showTidyToast(
+            `Closed ${closedDuplicates} duplicate tab${closedDuplicates === 1 ? "" : "s"}`,
+            "info"
+          );
+        }
       }
 
       // --- Step 1: Get ALL Existing Group Names for Context ---
@@ -3329,7 +3712,8 @@
       );
       if (initialTabsToSort.length === 0) {
         console.log("[TabSort] Debug - No tabs to sort, returning early");
-        showTidyToast("Nothing to tidy!", "info");
+        // The duplicates toast already told the user what happened.
+        if (closedDuplicates === 0) showTidyToast("Nothing to tidy!", "info");
         return;
       }
 
@@ -3655,7 +4039,7 @@
         }
       } // End loop through final groups
 
-      // --- Reorder tabs: groups first, then ungrouped tabs ---
+      // --- Reorder tabs: ungrouped tabs below the groups, or above them (pref) ---
       try {
         const workspaceElement = gZenWorkspaces?.activeWorkspaceElement;
         
@@ -3692,8 +4076,10 @@
           
           console.log("[TabSort] Reorder - groups:", groups.length, "ungrouped:", ungroupedTabs.length);
           
-          // Only reorder if we have both groups AND ungrouped tabs
-          if (groups.length > 0 && ungroupedTabs.length > 0) {
+          if (getUngroupedOnTopEnabled()) {
+            moveLooseTabsAboveGroups(tabsContainer);
+          } else if (groups.length > 0 && ungroupedTabs.length > 0) {
+            // Only reorder if we have both groups AND ungrouped tabs
             console.log("[TabSort] Reorder - Moving ungrouped tabs below groups...");
             
             // Move each ungrouped tab to after the last group
@@ -4342,6 +4728,612 @@
     ]);
   };
 
+  // --- Auto-sort new tabs (opt-in, zen.tidy-tabs.auto-sort-new-tabs) ---
+  // Each tab opened after session restore is sorted once, when its first
+  // real page has loaded. Ready tabs are batched into one embedding run
+  // and matched with the same helpers (and strictness) as the broom sort.
+  // tab -> time it started loading a real URL (null while still about:*).
+  // WeakMap so closed tabs never leak.
+  let autoSortPending = new WeakMap();
+  const autoSortReady = new Set(); // loaded tabs waiting for the next batch
+  const autoSortHandled = new WeakSet(); // once only: dragged-out tabs stay put
+  const autoSortRetried = new WeakSet(); // transient failures get one retry
+  // Loose singletons that matched nothing, kept across batches so tabs that
+  // arrive one-by-one can still form a group once 2+ on a topic exist.
+  // wsId -> [{ tab, embedding }]. Pruned on every use (closed/grouped tabs
+  // drop out) and capped so unrelated tabs can't grow it forever.
+  const autoSortLoosePool = new Map();
+  const AUTO_SORT_POOL_LIMIT = 30;
+  const getAutoSortPool = (wsId) => {
+    let pool = autoSortLoosePool.get(wsId);
+    if (!pool) {
+      pool = [];
+      autoSortLoosePool.set(wsId, pool);
+    }
+    // Drop tabs that are gone or no longer sortable.
+    const live = pool.filter((e) => e?.tab?.isConnected && isAutoSortCandidate(e.tab) && Array.isArray(e.embedding));
+    if (live.length !== pool.length) autoSortLoosePool.set(wsId, live);
+    return live;
+  };
+  let autoSortListeners = []; // [target, eventName, handler]
+  let autoSortTimer = null;
+  let autoSortArmTimer = null;
+  let autoSortBusyRetries = 0;
+  let autoSortGeneration = 0; // bumped on teardown: late arms / in-flight batches bail
+  // Sine re-runs the script on rebuild; the previous copy's teardown lives
+  // here so its listeners don't double-sort.
+  const AUTO_SORT_TEARDOWN_KEY = Symbol.for("zen-tidy-tabs.auto-sort.teardown");
+
+  const UNREADY_TITLES = new Set([
+    "Untitled Page",
+    "Invalid Tab",
+    "Error Processing Tab",
+  ]);
+
+  const getTabURLSpec = (tab) => {
+    try {
+      return tab?.linkedBrowser?.currentURI?.spec || "";
+    } catch (_e) {
+      return "";
+    }
+  };
+
+  // Loaded = not busy, real title, real (non-about:) URL.
+  const isTabReadyForAutoSort = (tab) => {
+    try {
+      if (!tab?.isConnected || tab.hasAttribute("busy")) return false;
+      const spec = getTabURLSpec(tab);
+      if (!spec || spec.startsWith("about:")) return false;
+      return !UNREADY_TITLES.has(getTabTitle(tab));
+    } catch (_e) {
+      return false;
+    }
+  };
+
+  // "skip": never auto-sort (incl. already grouped: the drag-out guarantee).
+  // "wait": transient state, worth one retry. "ok": sortable now.
+  const getAutoSortTabState = (tab) => {
+    if (
+      !tab?.isConnected ||
+      tab.closing ||
+      tab.pinned ||
+      tab.hasAttribute("zen-essential") ||
+      tab.closest("tab-group") // e.g. opened from a grouped tab: Firefox grouped it
+    ) {
+      return "skip";
+    }
+    if (
+      tab.hasAttribute("zen-glance-tab") ||
+      tab.hasAttribute("zen-empty-tab") ||
+      !tab.getAttribute("zen-workspace-id")
+    ) {
+      return "wait";
+    }
+    return "ok";
+  };
+  const isAutoSortCandidate = (tab) => getAutoSortTabState(tab) === "ok";
+
+  const scheduleAutoSortBatch = (delay = CONFIG.AUTO_SORT_DEBOUNCE_MS) => {
+    if (autoSortTimer != null) clearTimeout(autoSortTimer);
+    autoSortTimer = setTimeout(runAutoSortBatch, delay);
+  };
+
+  const onAutoSortTabOpen = (event) => {
+    try {
+      if (!getAutoSortEnabled()) return;
+      const tab = event.target;
+      if (!tab || autoSortHandled.has(tab)) return;
+      autoSortPending.set(tab, null);
+    } catch (e) {
+      console.error("[TabSort][Auto] TabOpen handler failed:", e);
+    }
+  };
+
+  const onAutoSortTabAttrModified = (event) => {
+    try {
+      const tab = event.target;
+      if (!autoSortPending.has(tab)) return;
+      if (!getAutoSortEnabled()) {
+        autoSortPending.delete(tab);
+        return;
+      }
+      // Blank/newtab placeholder waiting for the user to type: no TTL yet.
+      const spec = getTabURLSpec(tab);
+      if (!spec || spec.startsWith("about:")) return;
+      let loadStartedAt = autoSortPending.get(tab);
+      if (loadStartedAt == null) {
+        loadStartedAt = Date.now();
+        autoSortPending.set(tab, loadStartedAt);
+      }
+      if (Date.now() - loadStartedAt > CONFIG.AUTO_SORT_PENDING_TTL_MS) {
+        autoSortPending.delete(tab);
+        return;
+      }
+      if (!isTabReadyForAutoSort(tab)) return;
+      autoSortPending.delete(tab);
+      autoSortReady.add(tab);
+      scheduleAutoSortBatch();
+    } catch (e) {
+      console.error("[TabSort][Auto] TabAttrModified handler failed:", e);
+    }
+  };
+
+  // Undo-close / session restore: not a new tab, never auto-sort it.
+  const onAutoSortTabRestoring = (event) => {
+    autoSortPending.delete(event.target);
+    autoSortReady.delete(event.target);
+  };
+
+  const onAutoSortTabClose = (event) => {
+    autoSortPending.delete(event.target);
+    autoSortReady.delete(event.target);
+  };
+
+  const showAutoSortToast = (moved, created) => {
+    const createdTabs = created.reduce((n, g) => n + g.count, 0);
+    if (moved.length === 0 && created.length === 0) return;
+    if (created.length === 0 && moved.length === 1) {
+      showTidyToast(`Moved to “${moved[0]}”`, "info");
+    } else if (moved.length === 0 && created.length === 1) {
+      showTidyToast(`New group “${created[0].label}”`, "info");
+    } else {
+      showTidyToast(`Sorted ${moved.length + createdTabs} new tabs`, "info");
+    }
+  };
+
+  // Sorts one batch of ready tabs. Never expands collapsed groups.
+  const autoSortTabs = async (tabs) => {
+    const generation = autoSortGeneration;
+    // Teardown (Sine re-run / unload), pref off, or broom sort running.
+    const shouldStop = () =>
+      generation !== autoSortGeneration ||
+      !getAutoSortEnabled() ||
+      isSorting ||
+      broomWaiting;
+    const retryTabs = []; // transient failures (no embedding, state not settled)
+    const moved = []; // group label per moved tab
+    const created = []; // { label, count }
+
+    const moveToGroup = (tab, groupEl, label, detail = "") => {
+      try {
+        const wasCollapsed = groupEl.collapsed;
+        gBrowser.moveTabToExistingGroup(tab, groupEl);
+        // Adding a tab expands the group; put it back as the user left it.
+        if (wasCollapsed && !groupEl.collapsed) groupEl.collapsed = true;
+        moved.push(label);
+        console.log(`[TabSort][Auto] Moved "${getTabTitle(tab)}" to "${label}"${detail}`);
+      } catch (e) {
+        console.error(`[TabSort][Auto] Failed to move tab to "${label}":`, e);
+      }
+    };
+
+    // Live (case-insensitive) lookup, so groups made earlier in this batch count.
+    const findGroupByLabel = (wsId, label) => {
+      const want = String(label).toLowerCase();
+      for (const [l, info] of collectWorkspaceGroups(wsId)) {
+        if (l.toLowerCase() === want && info.element?.isConnected) {
+          return { label: l, element: info.element };
+        }
+      }
+      return null;
+    };
+
+    // New group for these tabs, or join the same-named one if it exists.
+    const createGroup = (wsId, label, groupTabs) => {
+      if (groupTabs.length === 0) return;
+      // Name already taken in this space (incl. groups made earlier in
+      // this batch): join that group instead of creating a duplicate.
+      const same = findGroupByLabel(wsId, label);
+      if (same) {
+        groupTabs.forEach((tab) =>
+          moveToGroup(tab, same.element, same.label, " (same name as new group)")
+        );
+        return;
+      }
+      try {
+        const newGroup = gBrowser.addTabGroup(groupTabs, {
+          label,
+          insertBefore: groupTabs[0],
+        });
+        if (!newGroup?.isConnected) {
+          console.warn(`[TabSort][Auto] addTabGroup returned no group for "${label}"`);
+          return;
+        }
+        created.push({ label, count: groupTabs.length });
+        console.log(
+          `[TabSort][Auto] Created group "${label}" with ${groupTabs.length} tab(s)`
+        );
+        // No _useFaviconColor, same as the broom sort (issue #9 p.p.s.):
+        // the favicon-average color is unreadable as expanded label text.
+        if (getAutoIconsEnabled()) {
+          // Fire-and-forget: icons must never delay the sort.
+          assignGroupIconsBackground([
+            {
+              element: newGroup,
+              topic: label,
+              titles: groupTabs
+                .map((t) => getTabTitle(t))
+                .filter(Boolean)
+                .slice(0, 8),
+            },
+          ]).catch((e) => console.error("[TabSort][Auto] Icon pass failed:", e));
+        }
+      } catch (e) {
+        console.error(`[TabSort][Auto] Error creating group "${label}":`, e);
+      }
+    };
+
+    try {
+      const byWorkspace = new Map();
+      for (const tab of tabs) {
+        if (autoSortHandled.has(tab)) continue;
+        const state = getAutoSortTabState(tab);
+        if (state === "skip") {
+          autoSortHandled.add(tab);
+          continue;
+        }
+        if (state === "wait") {
+          retryTabs.push(tab);
+          continue;
+        }
+        const wsId = tab.getAttribute("zen-workspace-id");
+        if (!byWorkspace.has(wsId)) byWorkspace.set(wsId, []);
+        byWorkspace.get(wsId).push(tab);
+      }
+
+      for (const [wsId, wsTabs] of byWorkspace) {
+        if (shouldStop()) break;
+        const existingGroups = collectWorkspaceGroups(wsId);
+        // Nothing to match against and not allowed to create: skip inference.
+        if (existingGroups.size === 0 && !getAutoSortCreateGroupsEnabled()) {
+          wsTabs.forEach((tab) => autoSortHandled.add(tab));
+          console.log(
+            `[TabSort][Auto] No groups in workspace ${wsId}, leaving ${wsTabs.length} tab(s) ungrouped`
+          );
+          continue;
+        }
+
+        // 1. Site rules: decided without any AI, so these tabs skip it.
+        let remaining = wsTabs;
+        if (parseRules(getRulesText()).length > 0) {
+          remaining = [];
+          for (const tab of wsTabs) {
+            const ruleLabel = isAutoSortCandidate(tab) ? matchRule(tab) : null;
+            if (!ruleLabel) {
+              remaining.push(tab);
+              continue;
+            }
+            autoSortHandled.add(tab);
+            const existing = findGroupByLabel(wsId, ruleLabel);
+            if (existing) {
+              moveToGroup(tab, existing.element, existing.label, " (rule)");
+            } else if (getAutoSortCreateGroupsEnabled()) {
+              createGroup(wsId, ruleLabel, [tab]);
+            }
+          }
+        }
+
+        if (remaining.length === 0) continue;
+
+        // Same text form as the group vectors (embedWorkspaceGroups) and the
+        // broom sort: URL + title.
+        const titles = remaining.map((tab) => getTabTitle(tab));
+        const texts = remaining.map((tab, i) =>
+          tabToEmbeddingText(getTabUrlSpec(tab), titles[i] || "")
+        );
+        const embeddings = await getEmbeddingsForTitles(texts);
+        if (generation !== autoSortGeneration) return;
+        // Once a tab has an embedding it has had its one shot.
+        remaining.forEach((tab, i) => {
+          if (embeddings[i]) autoSortHandled.add(tab);
+          else retryTabs.push(tab);
+        });
+        const groupEmbeddings = await embedWorkspaceGroups(existingGroups);
+        if (shouldStop()) break;
+
+        const unmatchedTabs = [];
+        const unmatchedEmbeddings = [];
+        for (let i = 0; i < remaining.length; i++) {
+          const tab = remaining[i];
+          if (!embeddings[i]) continue;
+          // State may have changed during inference (closed, grouped, pinned...).
+          if (!isAutoSortCandidate(tab)) continue;
+          const match = findAutoSortGroup(
+            tab,
+            titles[i],
+            embeddings[i],
+            existingGroups,
+            groupEmbeddings
+          );
+          const groupEl = match ? existingGroups.get(match.groupName)?.element : null;
+          if (groupEl?.isConnected) {
+            moveToGroup(
+              tab,
+              groupEl,
+              match.groupName,
+              ` (similarity: ${match.similarity.toFixed(3)}, type: ${match.matchType})`
+            );
+            continue;
+          }
+          unmatchedTabs.push(tab);
+          unmatchedEmbeddings.push(embeddings[i]);
+        }
+
+        if (unmatchedTabs.length === 0) continue;
+        if (!getAutoSortCreateGroupsEnabled()) {
+          console.log(
+            `[TabSort][Auto] ${unmatchedTabs.length} tab(s) match no group, leaving them ungrouped`
+          );
+          continue;
+        }
+
+        // New groups need 2+ tabs, but tabs arrive one batch at a time, so a
+        // lone banking tab can't wait for its batch-mates. Keep unmatched
+        // singletons in a per-space pool and cluster pool + current batch
+        // together: once 2+ on a topic exist (across batches) they form a
+        // group. Singles never seed a group alone; leftovers stay pooled.
+        const pool = getAutoSortPool(wsId);
+        // Pool tabs may now match groups created since (broom, user, prior
+        // auto-sort batch): retry them first with stored embeddings.
+        const stillPooled = [];
+        for (const entry of pool) {
+          if (shouldStop()) {
+            stillPooled.push(entry);
+            continue;
+          }
+          const match = findAutoSortGroup(
+            entry.tab,
+            getTabTitle(entry.tab),
+            entry.embedding,
+            existingGroups,
+            groupEmbeddings
+          );
+          const groupEl = match ? existingGroups.get(match.groupName)?.element : null;
+          if (groupEl?.isConnected && isAutoSortCandidate(entry.tab)) {
+            moveToGroup(
+              entry.tab,
+              groupEl,
+              match.groupName,
+              ` (similarity: ${match.similarity.toFixed(3)}, type: ${match.matchType}, pooled)`
+            );
+          } else if (entry.tab?.isConnected && isAutoSortCandidate(entry.tab)) {
+            stillPooled.push(entry);
+          }
+        }
+        const pooledTabs = stillPooled.map((e) => e.tab);
+        const pooledEmbeddings = stillPooled.map((e) => e.embedding);
+        const combinedTabs = pooledTabs.concat(unmatchedTabs);
+        const combinedEmbeddings = pooledEmbeddings.concat(unmatchedEmbeddings);
+        const clusters = clusterEmbeddings(
+          combinedEmbeddings,
+          CONFIG.SIMILARITY_THRESHOLD
+        );
+        const groupedSet = new Set(); // combined indices now in a group
+        for (const cluster of clusters) {
+          if (shouldStop() || !getAutoSortCreateGroupsEnabled()) break;
+          const members = cluster.filter((idx) =>
+            isAutoSortCandidate(combinedTabs[idx])
+          );
+          const clusterTabs = members.map((idx) => combinedTabs[idx]);
+          if (clusterTabs.length < 2) continue;
+          const clusterTitles = clusterTabs.map((tab) => getTabTitle(tab));
+          const label = await nameGroupWithSmartTabTopic(
+            clusterTitles,
+            clusterTabs.map((tab) =>
+              urlToEmbeddingText(getTabUrlSpec(tab), getTabTitle(tab))
+            ),
+            members.map((idx) => combinedEmbeddings[idx])
+          );
+          // Naming is async: re-validate before touching the DOM.
+          if (shouldStop()) break;
+          const live = clusterTabs.filter(isAutoSortCandidate);
+          if (live.length < 2) {
+            // Fell below 2 while naming: keep as pool candidates below.
+            continue;
+          }
+          createGroup(wsId, label, live);
+          members.forEach((idx) => {
+            if (live.includes(combinedTabs[idx])) groupedSet.add(idx);
+          });
+        }
+        // Refresh the pool: grouped tabs leave, surviving singles stay
+        // (current-batch singles join the pool for future batches).
+        const nextPool = [];
+        for (let idx = 0; idx < combinedTabs.length; idx++) {
+          if (groupedSet.has(idx)) continue;
+          const tab = combinedTabs[idx];
+          if (!tab?.isConnected || !isAutoSortCandidate(tab)) continue;
+          if (tab.closest("tab-group")) continue;
+          nextPool.push({ tab, embedding: combinedEmbeddings[idx] });
+        }
+        // Singles get one chance to join a just-created group (clear-winner),
+        // so a third banking tab can land in the group its two pooled
+        // batch-mates just formed even when clustering left it out.
+        if (nextPool.length > 0 && !shouldStop() && getAutoSortCreateGroupsEnabled() && created.length > 0) {
+          try {
+            const freshGroups = collectWorkspaceGroups(wsId);
+            const freshEmbeddings = await embedWorkspaceGroups(freshGroups);
+            if (!shouldStop()) {
+              for (let p = nextPool.length - 1; p >= 0; p--) {
+                const entry = nextPool[p];
+                const match = findAutoSortGroup(
+                  entry.tab,
+                  getTabTitle(entry.tab),
+                  entry.embedding,
+                  freshGroups,
+                  freshEmbeddings
+                );
+                const groupEl = match ? freshGroups.get(match.groupName)?.element : null;
+                if (groupEl?.isConnected && isAutoSortCandidate(entry.tab)) {
+                  moveToGroup(
+                    entry.tab,
+                    groupEl,
+                    match.groupName,
+                    ` (similarity: ${match.similarity.toFixed(3)}, type: ${match.matchType}, joined new group)`
+                  );
+                  nextPool.splice(p, 1);
+                }
+              }
+            }
+          } catch (e) {
+            console.warn("[TabSort][Auto] Singleton attach to new groups failed:", e?.message || e);
+          }
+        }
+        // Cap the pool (oldest out) so unrelated tabs can't grow it forever.
+        while (nextPool.length > AUTO_SORT_POOL_LIMIT) nextPool.shift();
+        autoSortLoosePool.set(wsId, nextPool);
+        if (nextPool.length > 0) {
+          console.log(
+            `[TabSort][Auto] ${nextPool.length} loose tab(s) pooled in this space waiting for a partner`
+          );
+        }
+      }
+
+      if (generation !== autoSortGeneration) return;
+      moveLooseTabsAboveGroupsEverywhere();
+      showAutoSortToast(moved, created);
+    } finally {
+      // One retry on the next batch, then give up on the tab for good.
+      if (generation === autoSortGeneration) {
+        let requeued = 0;
+        for (const tab of retryTabs) {
+          if (autoSortHandled.has(tab) || !tab.isConnected) continue;
+          if (autoSortRetried.has(tab)) {
+            autoSortHandled.add(tab);
+            continue;
+          }
+          autoSortRetried.add(tab);
+          autoSortReady.add(tab);
+          requeued++;
+        }
+        if (requeued > 0) {
+          console.log(`[TabSort][Auto] Retrying ${requeued} tab(s) in the next batch`);
+          scheduleAutoSortBatch();
+        }
+      }
+    }
+  };
+
+  const runAutoSortBatch = () => {
+    autoSortTimer = null;
+    try {
+      if (!getAutoSortEnabled()) {
+        autoSortReady.clear();
+        return;
+      }
+      if (autoSortReady.size === 0) return;
+      // Broom sort (or a previous batch) owns the tabs right now: back off
+      // and retry. Tabs are never dropped here: they stay queued in
+      // autoSortReady until the in-flight sort settles. Concurrency is
+      // unchanged (never two sorts at once); only the loss is fixed.
+      // A broom sort does not use up the budget.
+      if (isSorting || autoSortPromise) {
+        // Previous auto-sort batch still running: keep waiting with backoff
+        // instead of dropping. autoSortPromise always settles (run.finally
+        // clears it), so this cannot wait forever.
+        if (!isSorting) autoSortBusyRetries++;
+        const backoff =
+          autoSortBusyRetries > CONFIG.AUTO_SORT_MAX_BUSY_RETRIES
+            ? CONFIG.AUTO_SORT_RETRY_MS * 3
+            : CONFIG.AUTO_SORT_RETRY_MS;
+        scheduleAutoSortBatch(backoff);
+        return;
+      }
+      autoSortBusyRetries = 0;
+      const tabs = Array.from(autoSortReady);
+      autoSortReady.clear();
+      console.log(`[TabSort][Auto] Processing ${tabs.length} new tab(s)`);
+      const run = autoSortTabs(tabs).catch((e) =>
+        console.error("[TabSort][Auto] Batch failed:", e)
+      );
+      autoSortPromise = run;
+      run.finally(() => {
+        if (autoSortPromise === run) autoSortPromise = null;
+      });
+    } catch (e) {
+      console.error("[TabSort][Auto] Failed to start batch:", e);
+    }
+  };
+
+  const teardownAutoSort = () => {
+    autoSortGeneration++;
+    for (const [target, name, handler] of autoSortListeners) {
+      try {
+        target.removeEventListener(name, handler);
+      } catch (_e) {}
+    }
+    autoSortListeners = [];
+    if (autoSortTimer != null) {
+      clearTimeout(autoSortTimer);
+      autoSortTimer = null;
+    }
+    if (autoSortArmTimer != null) {
+      clearTimeout(autoSortArmTimer);
+      autoSortArmTimer = null;
+    }
+    autoSortPending = new WeakMap();
+    autoSortReady.clear();
+    autoSortLoosePool.clear();
+    autoSortBusyRetries = 0;
+    try {
+      if (window[AUTO_SORT_TEARDOWN_KEY] === teardownAutoSort) {
+        delete window[AUTO_SORT_TEARDOWN_KEY];
+      }
+    } catch (_e) {}
+  };
+
+  // Listeners are always attached (cheap); the pref is checked per event.
+  // Armed only after session restore so restored tabs are never sorted.
+  const setupAutoSort = () => {
+    if (
+      autoSortListeners.length > 0 ||
+      autoSortArmTimer != null ||
+      typeof gBrowser === "undefined" ||
+      !gBrowser.tabContainer
+    ) {
+      return;
+    }
+    try {
+      const previous = window[AUTO_SORT_TEARDOWN_KEY];
+      if (typeof previous === "function" && previous !== teardownAutoSort) {
+        previous();
+      }
+      window[AUTO_SORT_TEARDOWN_KEY] = teardownAutoSort;
+    } catch (_e) {}
+
+    const generation = autoSortGeneration;
+    const arm = () => {
+      autoSortArmTimer = null;
+      if (generation !== autoSortGeneration || autoSortListeners.length > 0) return;
+      const container = gBrowser?.tabContainer;
+      if (!container) return;
+      const listen = (name, handler) => {
+        container.addEventListener(name, handler);
+        autoSortListeners.push([container, name, handler]);
+      };
+      listen("TabOpen", onAutoSortTabOpen);
+      listen("TabAttrModified", onAutoSortTabAttrModified);
+      listen("SSTabRestoring", onAutoSortTabRestoring);
+      listen("TabClose", onAutoSortTabClose);
+      console.log("[TabSort][Auto] Listening for new tabs");
+    };
+
+    let restored = null;
+    try {
+      restored =
+        typeof SessionStore !== "undefined"
+          ? SessionStore.promiseAllWindowsRestored
+          : null;
+    } catch (_e) {}
+    if (restored && typeof restored.then === "function") {
+      restored.then(arm, arm);
+    } else {
+      // Fail closed: without the restore signal, give restore time to
+      // finish rather than risk sorting restored tabs.
+      autoSortArmTimer = setTimeout(arm, CONFIG.AUTO_SORT_ARM_FALLBACK_MS);
+    }
+  };
+
   // --- Add Tab Event Listeners for Visibility Updates ---
   function addTabEventListeners() {
     if (
@@ -4442,11 +5434,61 @@
     minTabsPrefObserver = null;
   }
 
+  // --- "Keep ungrouped tabs above groups" is a standing rule, not only a
+  // post-sort step: applied in every space once the session is restored, and
+  // again whenever the switch is turned on. Later manual drags are left alone. ---
+  let ungroupedOnTopObserver = null;
+
+  function setupUngroupedOnTop() {
+    if (ungroupedOnTopObserver) return;
+    try {
+      if (typeof Services === "undefined" || !Services.prefs?.addObserver) return;
+      ungroupedOnTopObserver = {
+        observe(_subject, topic, data) {
+          if (topic === "nsPref:changed" && data === UNGROUPED_ON_TOP_PREF) {
+            moveLooseTabsAboveGroupsEverywhere();
+          }
+        },
+      };
+      Services.prefs.addObserver(UNGROUPED_ON_TOP_PREF, ungroupedOnTopObserver);
+    } catch (e) {
+      console.error("[TabSort] Failed to observe ungrouped-on-top pref:", e);
+      ungroupedOnTopObserver = null;
+    }
+    let restored = null;
+    try {
+      restored =
+        typeof SessionStore !== "undefined"
+          ? SessionStore.promiseAllWindowsRestored
+          : null;
+    } catch (_e) {}
+    if (restored && typeof restored.then === "function") {
+      restored.then(moveLooseTabsAboveGroupsEverywhere, () => {});
+    } else {
+      moveLooseTabsAboveGroupsEverywhere();
+    }
+  }
+
+  function removeUngroupedOnTopObserver() {
+    try {
+      if (ungroupedOnTopObserver && typeof Services !== "undefined" && Services.prefs?.removeObserver) {
+        Services.prefs.removeObserver(UNGROUPED_ON_TOP_PREF, ungroupedOnTopObserver);
+      }
+    } catch (_e) {
+      /* ignore */
+    }
+    ungroupedOnTopObserver = null;
+  }
+
   // --- Cleanup Function ---
   const cleanup = () => {
     try {
       removeMinTabsPrefObserver();
+      removeUngroupedOnTopObserver();
       cancelWarmup();
+      try {
+        teardownAutoSort();
+      } catch (_e) {}
       // Stop any running animations
       cleanupAnimation();
       clearTidyToasts();
@@ -4506,6 +5548,8 @@
           setupMinTabsPrefObserver();
           updateButtonsVisibilityState();
           addTabEventListeners();
+          setupAutoSort();
+          setupUngroupedOnTop();
           // Pre-load ML engines idle so the first sort skips
           // createEngine + model-download latency.
           try {
