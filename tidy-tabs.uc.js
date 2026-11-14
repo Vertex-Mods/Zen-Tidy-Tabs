@@ -50,11 +50,7 @@
     // auto-sort embeds URL+title (title-only for non-web URLs), so it may need re-calibration.
     AUTO_SORT_MIN_SIMILARITY: 0.45,
     AUTO_SORT_MIN_MARGIN: 0.1,
-    // --- Local LLM (Ollama, opt-in) ---
-    LLM_TIMEOUT_MS: 20000, // Per call after the model is warm
-    LLM_FIRST_CALL_TIMEOUT_MS: 120000, // First successful call also loads the model into RAM; give it room
-    LLM_MAX_TIMEOUT_MS: 60000, // Cap of the per-call timeout, which scales with tab count
-    LLM_DOWN_RETRY_MS: 30000, // After a failure, skip the LLM (no network) for this long
+    // --- Site rules (opt-in) ---
   };
 
   // --- Ensure Firefox's local ML engine is enabled ---
@@ -79,12 +75,7 @@
   const AUTO_SORT_CREATE_GROUPS_PREF = "zen.tidy-tabs.auto-sort-create-groups";
   const UNGROUPED_ON_TOP_PREF = "zen.tidy-tabs.ungrouped-on-top";
   const CLOSE_DUPLICATES_PREF = "zen.tidy-tabs.close-duplicates";
-  const LLM_ENABLED_PREF = "zen.tidy-tabs.llm.enabled";
-  const LLM_ENDPOINT_PREF = "zen.tidy-tabs.llm.endpoint";
-  const LLM_MODEL_PREF = "zen.tidy-tabs.llm.model";
   const RULES_PREF = "zen.tidy-tabs.rules";
-  const LLM_DEFAULT_ENDPOINT = "http://localhost:11434";
-  const LLM_DEFAULT_MODEL = "qwen3:4b";
 
   // User-configurable minimum tab count for the sort button to appear.
   // The user can type any amount (including less than 6) in the mod settings.
@@ -231,39 +222,7 @@
     }
   };
 
-  // --- Local LLM (Ollama) + site rules: all opt-in ---
-  const getLlmEnabled = () => {
-    try {
-      return Services.prefs.getBoolPref(LLM_ENABLED_PREF, false);
-    } catch (_e) {
-      return false;
-    }
-  };
-
-  const getLlmEndpoint = () => {
-    try {
-      let v = Services.prefs
-        .getStringPref(LLM_ENDPOINT_PREF, LLM_DEFAULT_ENDPOINT)
-        .trim()
-        .replace(/\/+$/, "");
-      if (v && !/^[a-z][a-z0-9+.-]*:\/\//i.test(v)) v = `http://${v}`;
-      return v || LLM_DEFAULT_ENDPOINT;
-    } catch (_e) {
-      return LLM_DEFAULT_ENDPOINT;
-    }
-  };
-
-  const getLlmModel = () => {
-    try {
-      return (
-        Services.prefs.getStringPref(LLM_MODEL_PREF, LLM_DEFAULT_MODEL).trim() ||
-        LLM_DEFAULT_MODEL
-      );
-    } catch (_e) {
-      return LLM_DEFAULT_MODEL;
-    }
-  };
-
+  // --- Site rules (opt-in): "part-of-address => Group" lines ---
   const getRulesText = () => {
     try {
       return Services.prefs.getStringPref(RULES_PREF, "");
@@ -273,8 +232,8 @@
   };
 
   // Title (max 120 chars) + host/path of a tab. No query string or hash is
-  // ever sent to the model; non-http(s) tabs get an empty url.
-  const tabTextForLlm = (tab) => {
+  // ever used; non-http(s) tabs get an empty url.
+  const tabSiteText = (tab) => {
     let title = "";
     let url = "";
     try {
@@ -292,98 +251,6 @@
       /* ignore */
     }
     return { title, url };
-  };
-
-  let llmDownUntil = 0;
-  const isLlmDownNow = () => Date.now() < llmDownUntil;
-  const isLlmActive = () => getLlmEnabled() && !isLlmDownNow();
-
-  // One Ollama chat call with a JSON-schema constrained reply. Returns the
-  // parsed object or null on ANY failure (never throws). A failure marks the
-  // LLM down for LLM_DOWN_RETRY_MS: calls return null instantly, no network.
-  // Per-call timeout grows with the number of tabs in the prompt.
-  const llmTimeoutMs = (tabCount) =>
-    Math.min(CONFIG.LLM_MAX_TIMEOUT_MS, 10000 + 400 * tabCount);
-
-  let llmRemoteWarned = false;
-  let llmEverSucceeded = false; // first success also pays model load; allow a longer timeout until then
-  const warnIfRemoteEndpoint = (endpoint) => {
-    if (llmRemoteWarned) return;
-    try {
-      const host = new URL(endpoint).hostname;
-      if (!["localhost", "127.0.0.1", "[::1]", "::1"].includes(host)) {
-        llmRemoteWarned = true;
-        console.warn(
-          `[TabSort][LLM] endpoint host "${host}" is not local: tab titles and addresses are sent there`
-        );
-      }
-    } catch (_e) {
-      /* ignore */
-    }
-  };
-
-  // Names no group should get: such tabs stay loose instead.
-  const GENERIC_GROUP_NAME_RE =
-    /^(misc|other|general|various|tabs|uncategorized|miscellaneous|browsing)$/i;
-
-  const llmChat = async (
-    messages,
-    schema,
-    { timeoutMs = CONFIG.LLM_TIMEOUT_MS } = {}
-  ) => {
-    if (!getLlmEnabled()) return null;
-    if (isLlmDownNow()) return null;
-    // First-ever call loads the model into RAM (seconds on spinning disk):
-    // don't let the warm-call timeout fail it and mark the LLM down.
-    const effectiveTimeout = llmEverSucceeded
-      ? timeoutMs
-      : Math.max(timeoutMs, CONFIG.LLM_FIRST_CALL_TIMEOUT_MS);
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), effectiveTimeout);
-    try {
-      const endpoint = getLlmEndpoint();
-      warnIfRemoteEndpoint(endpoint);
-      const res = await fetch(`${endpoint}/api/chat`, {
-        method: "POST",
-        credentials: "omit",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          model: getLlmModel(),
-          messages,
-          stream: false,
-          think: false,
-          format: schema,
-          keep_alive: "30m",
-          options: { temperature: 0, num_ctx: 8192 },
-        }),
-        signal: controller.signal,
-      });
-      if (!res.ok) {
-        const detail = (await res.json().catch(() => ({})))?.error;
-        throw new Error(`HTTP ${res.status}${detail ? `: ${detail}` : ""}`);
-      }
-      const data = await res.json();
-      const parsed = JSON.parse(data?.message?.content);
-      if (parsed === null || typeof parsed !== "object") {
-        throw new Error("reply is not a JSON object");
-      }
-      llmDownUntil = 0;
-      llmEverSucceeded = true;
-      return parsed;
-    } catch (e) {
-      const wasUp = !isLlmDownNow();
-      llmDownUntil = Date.now() + CONFIG.LLM_DOWN_RETRY_MS;
-      if (wasUp) {
-        console.warn(
-          `[TabSort][LLM] call failed, using built-in AI for ${
-            CONFIG.LLM_DOWN_RETRY_MS / 1000
-          }s: ${e?.name === "AbortError" ? "timeout" : e?.message || e}`
-        );
-      }
-      return null;
-    } finally {
-      clearTimeout(timer);
-    }
   };
 
   // "pattern => Group name" rules, one per line or ';'-separated.
@@ -413,7 +280,7 @@
     try {
       const rules = parseRules(getRulesText());
       if (!rules.length) return null;
-      const { url } = tabTextForLlm(tab);
+      const { url } = tabSiteText(tab);
       if (!url) return null;
       const hay = url.toLowerCase();
       for (const r of rules) if (hay.includes(r.pattern)) return r.group;
@@ -421,208 +288,6 @@
       /* ignore */
     }
     return null;
-  };
-
-  // Prompt building blocks shared by llmAssignTabs and llmClusterTabs.
-  // `groups` is a Map label -> { element?, tabTitles? }.
-  const llmGroupLines = (groups) =>
-    Array.from(groups.keys()).map((label) => {
-      const info = groups.get(label) || {};
-      let titles = info.tabTitles;
-      if (!titles && info.element?.isConnected) {
-        titles = Array.from(info.element.querySelectorAll("tab")).map((t) =>
-          getTabTitle(t)
-        );
-      }
-      titles = (titles || [])
-        .filter(Boolean)
-        .slice(0, 5)
-        .map((t) => String(t).slice(0, 80));
-      return titles.length
-        ? `- "${label}": ${titles.join(" | ")}`
-        : `- "${label}"`;
-    });
-  const llmTabLines = (tabs) =>
-    tabs.map((tab, i) => {
-      const { title, url } = tabTextForLlm(tab);
-      return `${i}. ${title || "(untitled)"}${url ? ` -- ${url}` : ""}`;
-    });
-
-  const LLM_NEW_GROUP_MAX = 24;
-  // Tabs per llmAssignTabs call (broom and auto-sort). 20-tab chunks dumped
-  // generic pages into groups (16 wrong of 60); 1-per-call gave 2 wrong but
-  // costs ~1s per tab (~60s for 60 tabs). 5 per call is the compromise: small
-  // enough that tabs are still judged on their own (generic pages stay out),
-  // 5x fewer round-trips. The system prompt and groups block precede the tab
-  // text and are identical across calls, so Ollama reuses its prefix (KV) cache.
-  const LLM_ASSIGN_CHUNK = 5;
-  const LLM_NEWGROUP_CHUNK = 20; // auto-sort pass 2: loose tabs per llmClusterTabs call
-  // One LLM call that files tabs into groups. `groups` is a Map label ->
-  // { element?, tabTitles? }: existing groups only (callers pass real groups
-  // from collectWorkspaceGroups, element and tabTitles set). No proposed names
-  // are passed anymore. New groups come from llmClusterTabs. Returns an array
-  // parallel to `tabs` of { group } (the real label from `groups`, or null),
-  // or null when the LLM is unusable or its reply is invalid.
-  const llmAssignTabs = async (tabs, groups) => {
-    if (!tabs.length || !isLlmActive()) return null;
-    try {
-      const labels = Array.from(groups.keys());
-      const byLower = new Map(labels.map((l) => [l.toLowerCase(), l]));
-      const groupLines = llmGroupLines(groups);
-      const tabLines = llmTabLines(tabs);
-      // Existing groups only: new groups come from llmClusterTabs, never here.
-      // Each tab is judged on its own: neighbors in the same call must not
-      // rescue a generic page or a vague match into a group.
-      const system =
-        "You file browser tabs into tab groups. A tab left ungrouped is fine; a tab in the wrong group is not.\n" +
-        "Rules:\n" +
-        '- Set "group" to an existing group name when the tab is the same kind of content or topic as that group\'s tabs (for example another recipe for a recipes group, another pull request for a pull request group). Copy the name exactly. If the match is only vague or partial, use null.\n' +
-        "- Generic utility pages always get null: search engines, sign-in or account pages, email inboxes, maps, calendars, new tab pages, social media feeds, video homepages.\n" +
-        "- Judge each tab on its own; never assign a tab because other tabs in the same request share a topic. When unsure about a tab, use null. " +
-        'Answer with JSON only: one assignment per tab, using the tab number as "i".';
-      const user =
-        `Existing groups:\n${groupLines.length ? groupLines.join("\n") : "(none)"}\n\n` +
-        `Tabs:\n${tabLines.join("\n")}`;
-      const schema = {
-        type: "object",
-        properties: {
-          assignments: {
-            type: "array",
-            items: {
-              type: "object",
-              properties: {
-                i: { type: "integer" },
-                group: { type: ["string", "null"] },
-              },
-              required: ["i", "group"],
-            },
-          },
-        },
-        required: ["assignments"],
-      };
-      const reply = await llmChat(
-        [
-          { role: "system", content: system },
-          { role: "user", content: user },
-        ],
-        schema,
-        { timeoutMs: llmTimeoutMs(tabs.length) }
-      );
-      if (!reply) return null;
-      const list = reply.assignments;
-      if (!Array.isArray(list)) {
-        console.warn("[TabSort][LLM] reply has no assignments array, using built-in AI");
-        return null;
-      }
-      const out = tabs.map(() => ({ group: null }));
-      const nameOf = (v) => {
-        const t = typeof v === "string" ? v.trim() : "";
-        return /^(null|none|n\/a|-)?$/i.test(t) ? "" : t;
-      };
-      let valid = 0;
-      for (const a of list) {
-        if (!a || typeof a !== "object") continue;
-        if (!Number.isInteger(a.i) || a.i < 0 || a.i >= tabs.length) continue;
-        valid++;
-        const g = nameOf(a.group).toLowerCase();
-        out[a.i] = { group: g ? byLower.get(g) || null : null };
-      }
-      if (valid === 0) {
-        console.warn("[TabSort][LLM] reply had no usable assignments, using built-in AI");
-        return null;
-      }
-      return out;
-    } catch (e) {
-      console.warn("[TabSort][LLM] assign failed, using built-in AI:", e?.message || e);
-      return null;
-    }
-  };
-  // Broom sort, step 2: group loose tabs that share a clear topic into NEW
-  // named groups (existing groups were already tried via llmAssignTabs).
-  // `existingLabels` is a list of real group labels; a proposed name equal to
-  // one (case-insensitive) is mapped to it. Chunks of 40; later chunks are
-  // told the names proposed so far. Returns [{ name, tabs }] (tabs are the
-  // given tab objects, >= 2 each) or null when the LLM is unusable/invalid.
-  const LLM_CLUSTER_CHUNK = 40;
-  const llmClusterTabs = async (tabs, existingLabels = []) => {
-    if (!tabs.length || !isLlmActive()) return null;
-    try {
-      const byLower = new Map(existingLabels.map((l) => [l.toLowerCase(), l]));
-      const schema = {
-        type: "object",
-        properties: {
-          groups: {
-            type: "array",
-            items: {
-              type: "object",
-              properties: {
-                name: { type: "string" },
-                tabs: { type: "array", items: { type: "integer" } },
-              },
-              required: ["name", "tabs"],
-            },
-          },
-        },
-        required: ["groups"],
-      };
-      const merged = new Map(); // lowercase name -> { name, tabs }
-      for (let start = 0; start < tabs.length; start += LLM_CLUSTER_CHUNK) {
-        const chunk = tabs.slice(start, start + LLM_CLUSTER_CHUNK);
-        const proposed = Array.from(merged.values()).map((g) => g.name);
-        const system =
-          "You organize browser tabs into topic groups. Find every set of tabs about the same specific subject, project or activity, and put each set in its own group. A tab left out is fine; a tab in the wrong group is not.\n" +
-          "Rules:\n" +
-          "- A group needs 2 or more tabs about the same subject (same programming language, same trip or destination, same recipe collection, same product, same project). Pages about places or travel inside the same country or city belong together. Tabs do not have to be next to each other in the list, so read every tab and compare it with all the others. Name each group after its own tabs' subject.\n" +
-          "- Group name: 1-3 words, Title Case, max 24 characters, taken from the subject the tabs share.\n" +
-          "- Leave OUT of every group: generic utility pages (email inboxes, maps, search engines, calendars, sign-in or account pages, social media feeds, video homepages) and any tab with no partner on the same subject, such as a lone news article.\n" +
-          "- A tab goes in at most one group. When unsure, leave the tab out.\n" +
-          (proposed.length
-            ? `- Group names already used for earlier tabs: ${proposed
-                .map((n) => `"${n}"`)
-                .join(", ")}. Reuse the exact name when these tabs share that subject.\n`
-            : "") +
-          'Answer with JSON only: {"groups":[{"name":"...","tabs":[tab numbers]}]}. Use exactly the number in [brackets] at the start of each tab line, and re-check that every number you list belongs to that group.';
-        const user = `Tabs:\n${llmTabLines(chunk).map((l) => l.replace(/^(\d+)\. /, "[$1] ")).join("\n")}`;
-        const reply = await llmChat(
-          [
-            { role: "system", content: system },
-            { role: "user", content: user },
-          ],
-          schema,
-          { timeoutMs: llmTimeoutMs(chunk.length) }
-        );
-        if (!reply) return null;
-        if (!Array.isArray(reply.groups)) {
-          console.warn("[TabSort][LLM] cluster reply has no groups array, using built-in AI");
-          return null;
-        }
-        const used = new Set();
-        for (const g of reply.groups) {
-          if (!g || typeof g !== "object" || !Array.isArray(g.tabs)) continue;
-          let name = typeof g.name === "string" ? g.name.trim() : "";
-          name = name.replace(/^['"`]+|['"`]+$/g, "").slice(0, LLM_NEW_GROUP_MAX).trim();
-          if (!name || /^(null|none|n\/a|group|untitled|-)$/i.test(name)) continue;
-          if (GENERIC_GROUP_NAME_RE.test(name)) continue; // tabs stay loose
-          const idxs = [];
-          for (const i of g.tabs) {
-            if (!Number.isInteger(i) || i < 0 || i >= chunk.length) continue;
-            if (used.has(i) || idxs.includes(i)) continue;
-            idxs.push(i);
-          }
-          if (idxs.length < 2) continue; // first-wins applies only to groups kept
-          idxs.forEach((i) => used.add(i));
-          const key = name.toLowerCase();
-          const label = byLower.get(key) || name;
-          const mkey = label.toLowerCase();
-          if (!merged.has(mkey)) merged.set(mkey, { name: label, tabs: [] });
-          for (const i of idxs) merged.get(mkey).tabs.push(chunk[i]);
-        }
-      }
-      return Array.from(merged.values());
-    } catch (e) {
-      console.warn("[TabSort][LLM] cluster failed, using built-in AI:", e?.message || e);
-      return null;
-    }
   };
 
   const getTabIconURL = (tab) => {
@@ -2282,69 +1947,22 @@
     }
   }
 
-  // Group name for a set of tabs. Local LLM first (opt-in); any failure or
-  // unusable name falls through to the built-in smart-tab-topic namer.
+  // Group name for a set of tabs (built-in smart-tab-topic namer).
   // urlTexts / groupVectors are optional (URL hints + centroid fallback).
   async function nameGroupWithSmartTabTopic(
     titles,
     urlTexts = [],
     groupVectors = []
   ) {
-    // Local LLM first (opt-in); any failure/invalid name falls through to
-    // the smart-tab-topic path below, unchanged.
-    if (isLlmActive()) {
-      try {
-        const lines = (titles || [])
-          .filter(Boolean)
-          .slice(0, 12)
-          .map((t) => `- ${String(t).slice(0, 100)}`)
-          .join("\n");
-        const reply = await llmChat(
-          [
-            {
-              role: "system",
-              content:
-                "You name browser tab groups. Given the titles of the tabs in one group, answer with a short group name: 1-3 words, Title Case, naming the subject the tabs share. Example: titles about baking bread and pizza dough -> {\"name\":\"Baking\"}. Use a concrete subject, not a generic word like Group or Tabs. Always give a name. Answer with JSON only.",
-            },
-            { role: "user", content: `Tab titles:\n${lines}` },
-          ],
-          {
-            type: "object",
-            properties: { name: { type: "string" } },
-            required: ["name"],
-          }
-        );
-        const llmName = String(typeof reply?.name === "string" ? reply.name : "")
-          .trim()
-          .replace(/^['"`]+|['"`]+$/g, "")
-          .replace(/[.?!,:;]+$/, "")
-          .slice(0, 24)
-          .trim();
-        if (
-          llmName &&
-          !/^(group|untitled|new tab)$/i.test(llmName) &&
-          !GENERIC_GROUP_NAME_RE.test(llmName)
-        ) {
-          return llmName;
-        }
-        if (reply) {
-          console.warn("[TabSort][LLM] unusable group name, using built-in AI:", JSON.stringify(reply.name));
-        }
-      } catch (e) {
-        console.warn("[TabSort][LLM] naming failed, using built-in AI:", e?.message || e);
-      }
-    }
-
     return nameGroupBuiltin(titles, urlTexts, groupVectors);
   }
 
-  // Broom sort entry point: site rules first, then the local LLM (when
-  // enabled and reachable), else the built-in embedding code below.
-  // Returns [{ tab, topic }] like the built-in path.
+  // Broom sort entry point: site rules first, then the built-in embedding
+  // path below. Returns [{ tab, topic }] like the built-in path.
   const askAIForMultipleTopics = async (tabs) => {
     if (!Array.isArray(tabs) || tabs.length === 0) return [];
     const hasRules = parseRules(getRulesText()).length > 0;
-    if (!hasRules && !isLlmActive()) return askAIForMultipleTopicsBuiltin(tabs);
+    if (!hasRules) return askAIForMultipleTopicsBuiltin(tabs);
 
     const validTabs = tabs.filter((tab) => tab?.isConnected);
     if (!validTabs.length) return [];
@@ -2355,10 +1973,9 @@
     );
     const result = [];
 
-    // 1. Site rules (exempt from the >= 2 tabs rule). Existing group of the
+    // Site rules (exempt from the >= 2 tabs rule). Existing group of the
     // same name wins; otherwise the rule's name, created by the caller.
     const rest = [];
-    const ruleLabels = [];
     for (const tab of validTabs) {
       const rule = hasRules ? matchRule(tab) : null;
       if (!rule) {
@@ -2368,7 +1985,6 @@
       const topic = labelByLower.get(rule.toLowerCase()) || rule;
       if (!labelByLower.has(topic.toLowerCase())) {
         labelByLower.set(topic.toLowerCase(), topic);
-        ruleLabels.push(topic);
       }
       result.push({ tab, topic });
     }
@@ -2377,65 +1993,7 @@
     }
     if (!rest.length) return result;
 
-    // 2. Local LLM: existing groups first, then new groups for the leftovers.
-    if (isLlmActive()) {
-      try {
-        const llmResult = [];
-        let leftover = rest;
-        let ok = true;
-        let failedAt = -1;
-        if (groups.size > 0) {
-          leftover = [];
-          for (let s = 0; s < rest.length && ok; s += LLM_ASSIGN_CHUNK) {
-            const chunk = rest.slice(s, s + LLM_ASSIGN_CHUNK);
-            const assigned = await llmAssignTabs(chunk, groups);
-            if (!assigned) {
-              // Keep tabs already assigned; the failed chunk and every
-              // later tab go to the built-in path with the leftovers.
-              failedAt = s;
-              ok = false;
-              break;
-            }
-            chunk.forEach((tab, i) => {
-              const g = assigned[i]?.group;
-              if (g) llmResult.push({ tab, topic: g });
-              else leftover.push(tab);
-            });
-          }
-        }
-        if (failedAt >= 0) {
-          console.log(
-            `[TabSort][LLM] broom sort: LLM failed at tab ${failedAt}, built-in AI for the rest`
-          );
-          const unassigned = leftover.concat(rest.slice(failedAt));
-          return result
-            .concat(llmResult)
-            .concat(await askAIForMultipleTopicsBuiltin(unassigned));
-        }
-        if (ok && leftover.length >= 2) {
-          const clusters = await llmClusterTabs(leftover, [
-            ...groups.keys(),
-            ...ruleLabels,
-          ]);
-          if (!clusters) ok = false;
-          else {
-            for (const { name, tabs: ts } of clusters) {
-              for (const tab of ts) llmResult.push({ tab, topic: name });
-            }
-          }
-        }
-        if (ok) {
-          console.log(
-            `[TabSort][LLM] broom sort: ${llmResult.length} of ${rest.length} tab(s) grouped`
-          );
-          return result.concat(llmResult);
-        }
-      } catch (e) {
-        console.warn("[TabSort][LLM] broom sort failed, using built-in AI:", e?.message || e);
-      }
-    }
-
-    // LLM off or failed: built-in embedding path for the non-rule tabs.
+    // Built-in embedding path for the non-rule tabs.
     return result.concat(await askAIForMultipleTopicsBuiltin(rest));
   };
 
@@ -4076,14 +3634,7 @@
       try {
         await Promise.race([
           autoSortPromise,
-          sleepMs(
-            getLlmEnabled()
-              ? Math.max(
-                  CONFIG.AUTO_SORT_BROOM_WAIT_MS,
-                  CONFIG.LLM_MAX_TIMEOUT_MS + 2000
-                )
-              : CONFIG.AUTO_SORT_BROOM_WAIT_MS
-          ),
+          sleepMs(CONFIG.AUTO_SORT_BROOM_WAIT_MS),
         ]);
       } catch (_e) {}
       broomWaiting = false;
@@ -5187,6 +4738,23 @@
   const autoSortReady = new Set(); // loaded tabs waiting for the next batch
   const autoSortHandled = new WeakSet(); // once only: dragged-out tabs stay put
   const autoSortRetried = new WeakSet(); // transient failures get one retry
+  // Loose singletons that matched nothing, kept across batches so tabs that
+  // arrive one-by-one can still form a group once 2+ on a topic exist.
+  // wsId -> [{ tab, embedding }]. Pruned on every use (closed/grouped tabs
+  // drop out) and capped so unrelated tabs can't grow it forever.
+  const autoSortLoosePool = new Map();
+  const AUTO_SORT_POOL_LIMIT = 30;
+  const getAutoSortPool = (wsId) => {
+    let pool = autoSortLoosePool.get(wsId);
+    if (!pool) {
+      pool = [];
+      autoSortLoosePool.set(wsId, pool);
+    }
+    // Drop tabs that are gone or no longer sortable.
+    const live = pool.filter((e) => e?.tab?.isConnected && isAutoSortCandidate(e.tab) && Array.isArray(e.embedding));
+    if (live.length !== pool.length) autoSortLoosePool.set(wsId, live);
+    return live;
+  };
   let autoSortListeners = []; // [target, eventName, handler]
   let autoSortTimer = null;
   let autoSortArmTimer = null;
@@ -5445,128 +5013,6 @@
           }
         }
 
-        // 2. Local LLM: chunked calls for the rest of this workspace.
-        if (remaining.length > 0 && isLlmActive()) {
-          const createNew = getAutoSortCreateGroupsEnabled();
-          const llmTabs = remaining.filter(isAutoSortCandidate);
-          const newByName = new Map(); // lowercase name -> { name, tabs }
-          let llmFailed = false;
-          const loose = []; // tabs no existing group took
-          // Pass 1: one tab per call against the existing groups only.
-          for (let s = 0; s < llmTabs.length; s += LLM_ASSIGN_CHUNK) {
-            if (shouldStop()) break;
-            const chunk = llmTabs.slice(s, s + LLM_ASSIGN_CHUNK);
-            const assignments = await llmAssignTabs(chunk, existingGroups);
-            if (shouldStop()) break;
-            if (!assignments) {
-              llmFailed = true;
-              break;
-            }
-            chunk.forEach((tab, i) => {
-              autoSortHandled.add(tab);
-              // State may have changed during inference.
-              if (!isAutoSortCandidate(tab)) return;
-              const group = assignments[i]?.group;
-              const groupEl = group ? existingGroups.get(group)?.element : null;
-              if (groupEl?.isConnected) moveToGroup(tab, groupEl, group, " (llm)");
-              else loose.push(tab);
-            });
-          }
-          // Pass 2: a new group needs 2+ tabs on one subject, which a
-          // single-tab call can't see, so the loose tabs go in batches to the
-          // broom's cluster prompt. It does not see the existing groups (that
-          // block made qwen3:4b refuse new groups), and a cluster named like
-          // an existing group is dropped: pass 1 is the only way into one.
-          if (createNew && !llmFailed && !shouldStop() && loose.length >= 2) {
-            const existingLower = new Set(
-              Array.from(existingGroups.keys()).map((l) => l.toLowerCase())
-            );
-            for (let s = 0; s < loose.length; s += LLM_NEWGROUP_CHUNK) {
-              if (shouldStop() || !getAutoSortCreateGroupsEnabled()) break;
-              const chunk = loose.slice(s, s + LLM_NEWGROUP_CHUNK).filter(isAutoSortCandidate);
-              if (chunk.length < 2) continue;
-              const clusters = await llmClusterTabs(chunk, Array.from(existingGroups.keys()));
-              if (shouldStop()) break;
-              if (!clusters) break; // tabs stay loose; they were handled in pass 1
-              for (const { name, tabs: clusterTabs } of clusters) {
-                const key = name.toLowerCase();
-                if (existingLower.has(key)) {
-                  console.log(
-                    `[TabSort][Auto] LLM cluster "${name}" matches an existing group, leaving ${clusterTabs.length} tab(s) loose`
-                  );
-                  continue;
-                }
-                const members = clusterTabs.filter(isAutoSortCandidate);
-                if (members.length < 2) continue;
-                if (!newByName.has(key)) newByName.set(key, { name, tabs: [] });
-                newByName.get(key).tabs.push(...members);
-              }
-            }
-          }
-          if (shouldStop()) break;
-          for (const { name, tabs: groupTabs } of newByName.values()) {
-            if (shouldStop() || !getAutoSortCreateGroupsEnabled()) break;
-            const members = groupTabs.filter(isAutoSortCandidate);
-            if (members.length < 2) continue;
-            createGroup(wsId, name, members);
-          }
-          // Singles never seed a group, but may join one just created above:
-          // try the same clear-winner embedding rule against the refreshed
-          // group set (existing + new). Tabs that match nothing stay loose.
-          if (!llmFailed && createNew && newByName.size > 0 && !shouldStop()) {
-            try {
-              const clustered = new Set();
-              for (const { tabs: groupTabs } of newByName.values()) {
-                for (const t of groupTabs) clustered.add(t);
-              }
-              const singles = loose.filter(
-                (t) => !clustered.has(t) && isAutoSortCandidate(t) && !t.closest("tab-group")
-              );
-              if (singles.length > 0) {
-                const freshGroups = collectWorkspaceGroups(wsId);
-                const singlesTexts = singles.map((tab) =>
-                  tabToEmbeddingText(getTabUrlSpec(tab), getTabTitle(tab) || "")
-                );
-                const singlesEmbeddings = await getEmbeddingsForTitles(singlesTexts);
-                if (!shouldStop()) {
-                  const freshEmbeddings = await embedWorkspaceGroups(freshGroups);
-                  if (!shouldStop()) {
-                    for (let k = 0; k < singles.length; k++) {
-                      const tab = singles[k];
-                      if (!singlesEmbeddings[k] || !isAutoSortCandidate(tab)) continue;
-                      const match = findAutoSortGroup(
-                        tab,
-                        getTabTitle(tab),
-                        singlesEmbeddings[k],
-                        freshGroups,
-                        freshEmbeddings
-                      );
-                      const groupEl = match ? freshGroups.get(match.groupName)?.element : null;
-                      if (groupEl?.isConnected) {
-                        moveToGroup(
-                          tab,
-                          groupEl,
-                          match.groupName,
-                          ` (similarity: ${match.similarity.toFixed(3)}, type: ${match.matchType}, joined new group)`
-                        );
-                      }
-                    }
-                  }
-                }
-              }
-            } catch (e) {
-              console.warn("[TabSort][Auto] LLM singleton attach failed:", e?.message || e);
-            }
-          }
-          if (!llmFailed) {
-            // Every tab of this batch had its one shot (incl. non-candidates).
-            remaining.forEach((tab) => autoSortHandled.add(tab));
-            continue;
-          }
-          // LLM failed part-way: tabs it did not cover go to the built-in
-          // embedding path below, unchanged.
-          remaining = remaining.filter((tab) => !autoSortHandled.has(tab));
-        }
         if (remaining.length === 0) continue;
 
         // Same text form as the group vectors (embedWorkspaceGroups) and the
@@ -5621,73 +5067,125 @@
           continue;
         }
 
-        // New groups need 2+ tabs: singletons never seed a group on their
-        // own. After the multi-tab groups are created, leftover singletons
-        // get one chance to join a just-created group (same clear-winner
-        // rule), so a single tab can still land in a new group made by its
-        // batch-mates. Anything still unmatched stays loose.
+        // New groups need 2+ tabs, but tabs arrive one batch at a time, so a
+        // lone banking tab can't wait for its batch-mates. Keep unmatched
+        // singletons in a per-space pool and cluster pool + current batch
+        // together: once 2+ on a topic exist (across batches) they form a
+        // group. Singles never seed a group alone; leftovers stay pooled.
+        const pool = getAutoSortPool(wsId);
+        // Pool tabs may now match groups created since (broom, user, prior
+        // auto-sort batch): retry them first with stored embeddings.
+        const stillPooled = [];
+        for (const entry of pool) {
+          if (shouldStop()) {
+            stillPooled.push(entry);
+            continue;
+          }
+          const match = findAutoSortGroup(
+            entry.tab,
+            getTabTitle(entry.tab),
+            entry.embedding,
+            existingGroups,
+            groupEmbeddings
+          );
+          const groupEl = match ? existingGroups.get(match.groupName)?.element : null;
+          if (groupEl?.isConnected && isAutoSortCandidate(entry.tab)) {
+            moveToGroup(
+              entry.tab,
+              groupEl,
+              match.groupName,
+              ` (similarity: ${match.similarity.toFixed(3)}, type: ${match.matchType}, pooled)`
+            );
+          } else if (entry.tab?.isConnected && isAutoSortCandidate(entry.tab)) {
+            stillPooled.push(entry);
+          }
+        }
+        const pooledTabs = stillPooled.map((e) => e.tab);
+        const pooledEmbeddings = stillPooled.map((e) => e.embedding);
+        const combinedTabs = pooledTabs.concat(unmatchedTabs);
+        const combinedEmbeddings = pooledEmbeddings.concat(unmatchedEmbeddings);
         const clusters = clusterEmbeddings(
-          unmatchedEmbeddings,
+          combinedEmbeddings,
           CONFIG.SIMILARITY_THRESHOLD
         );
-        const singleIdxs = [];
+        const groupedSet = new Set(); // combined indices now in a group
         for (const cluster of clusters) {
           if (shouldStop() || !getAutoSortCreateGroupsEnabled()) break;
           const members = cluster.filter((idx) =>
-            isAutoSortCandidate(unmatchedTabs[idx])
+            isAutoSortCandidate(combinedTabs[idx])
           );
-          const clusterTabs = members.map((idx) => unmatchedTabs[idx]);
-          if (clusterTabs.length === 0) continue;
-          if (clusterTabs.length < 2) {
-            singleIdxs.push(...members);
-            continue;
-          }
+          const clusterTabs = members.map((idx) => combinedTabs[idx]);
+          if (clusterTabs.length < 2) continue;
           const clusterTitles = clusterTabs.map((tab) => getTabTitle(tab));
           const label = await nameGroupWithSmartTabTopic(
             clusterTitles,
             clusterTabs.map((tab) =>
               urlToEmbeddingText(getTabUrlSpec(tab), getTabTitle(tab))
             ),
-            members.map((idx) => unmatchedEmbeddings[idx])
+            members.map((idx) => combinedEmbeddings[idx])
           );
           // Naming is async: re-validate before touching the DOM.
           if (shouldStop()) break;
-          createGroup(wsId, label, clusterTabs.filter(isAutoSortCandidate));
+          const live = clusterTabs.filter(isAutoSortCandidate);
+          if (live.length < 2) {
+            // Fell below 2 while naming: keep as pool candidates below.
+            continue;
+          }
+          createGroup(wsId, label, live);
+          members.forEach((idx) => {
+            if (live.includes(combinedTabs[idx])) groupedSet.add(idx);
+          });
         }
-        // Singletons join just-created groups (or stay loose): never seed one.
-        if (singleIdxs.length > 0 && !shouldStop() && getAutoSortCreateGroupsEnabled()) {
+        // Refresh the pool: grouped tabs leave, surviving singles stay
+        // (current-batch singles join the pool for future batches).
+        const nextPool = [];
+        for (let idx = 0; idx < combinedTabs.length; idx++) {
+          if (groupedSet.has(idx)) continue;
+          const tab = combinedTabs[idx];
+          if (!tab?.isConnected || !isAutoSortCandidate(tab)) continue;
+          if (tab.closest("tab-group")) continue;
+          nextPool.push({ tab, embedding: combinedEmbeddings[idx] });
+        }
+        // Singles get one chance to join a just-created group (clear-winner),
+        // so a third banking tab can land in the group its two pooled
+        // batch-mates just formed even when clustering left it out.
+        if (nextPool.length > 0 && !shouldStop() && getAutoSortCreateGroupsEnabled() && created.length > 0) {
           try {
             const freshGroups = collectWorkspaceGroups(wsId);
             const freshEmbeddings = await embedWorkspaceGroups(freshGroups);
             if (!shouldStop()) {
-              for (const idx of singleIdxs) {
-                const tab = unmatchedTabs[idx];
-                if (!isAutoSortCandidate(tab)) continue;
+              for (let p = nextPool.length - 1; p >= 0; p--) {
+                const entry = nextPool[p];
                 const match = findAutoSortGroup(
-                  tab,
-                  getTabTitle(tab),
-                  unmatchedEmbeddings[idx],
+                  entry.tab,
+                  getTabTitle(entry.tab),
+                  entry.embedding,
                   freshGroups,
                   freshEmbeddings
                 );
                 const groupEl = match ? freshGroups.get(match.groupName)?.element : null;
-                if (groupEl?.isConnected) {
+                if (groupEl?.isConnected && isAutoSortCandidate(entry.tab)) {
                   moveToGroup(
-                    tab,
+                    entry.tab,
                     groupEl,
                     match.groupName,
                     ` (similarity: ${match.similarity.toFixed(3)}, type: ${match.matchType}, joined new group)`
                   );
-                } else {
-                  console.log(
-                    `[TabSort][Auto] "${getTabTitle(tab)}" matches no group (singleton, no new group seeded), leaving ungrouped`
-                  );
+                  nextPool.splice(p, 1);
                 }
               }
             }
           } catch (e) {
             console.warn("[TabSort][Auto] Singleton attach to new groups failed:", e?.message || e);
           }
+        }
+        // Cap the pool (oldest out) so unrelated tabs can't grow it forever.
+        while (nextPool.length > AUTO_SORT_POOL_LIMIT) nextPool.shift();
+        autoSortLoosePool.set(wsId, nextPool);
+        if (nextPool.length > 0) {
+          console.log(
+            `[TabSort][Auto] ${nextPool.length} loose tab(s) pooled in this space waiting for a partner`
+          );
         }
       }
 
@@ -5728,7 +5226,7 @@
       // and retry. Tabs are never dropped here: they stay queued in
       // autoSortReady until the in-flight sort settles. Concurrency is
       // unchanged (never two sorts at once); only the loss is fixed.
-      // A broom sort (possibly a slow LLM one) does not use up the budget.
+      // A broom sort does not use up the budget.
       if (isSorting || autoSortPromise) {
         // Previous auto-sort batch still running: keep waiting with backoff
         // instead of dropping. autoSortPromise always settles (run.finally
@@ -5775,6 +5273,7 @@
     }
     autoSortPending = new WeakMap();
     autoSortReady.clear();
+    autoSortLoosePool.clear();
     autoSortBusyRetries = 0;
     try {
       if (window[AUTO_SORT_TEARDOWN_KEY] === teardownAutoSort) {

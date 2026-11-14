@@ -55,39 +55,6 @@
     ]
   },
   {
-    "type": "separator",
-    "label": "Local LLM (Ollama)"
-  },
-  {
-    "property": "zen.tidy-tabs.llm.enabled",
-    "label": "Use a local LLM (Ollama) for sorting and naming",
-    "type": "checkbox",
-    "defaultValue": false,
-    "description": "Sends tab titles and addresses (no query strings) to Ollama on this computer. Usually more accurate than the built-in AI. If Ollama is not running, the built-in AI is used."
-  },
-  {
-    "property": "zen.tidy-tabs.llm.endpoint",
-    "label": "Ollama address",
-    "type": "string",
-    "placeholder": "http://localhost:11434",
-    "defaultValue": "http://localhost:11434",
-    "description": "Tab titles and addresses are sent to this address. Keep it on localhost unless you trust that machine.",
-    "conditions": [
-      { "if": { "property": "zen.tidy-tabs.llm.enabled", "value": true } }
-    ]
-  },
-  {
-    "property": "zen.tidy-tabs.llm.model",
-    "label": "Ollama model",
-    "type": "string",
-    "placeholder": "qwen3:4b",
-    "defaultValue": "qwen3:4b",
-    "description": "Name of the Ollama model to use. It must already be pulled.",
-    "conditions": [
-      { "if": { "property": "zen.tidy-tabs.llm.enabled", "value": true } }
-    ]
-  },
-  {
     "property": "zen.tidy-tabs.rules",
     "label": "Always put these sites in these groups",
     "type": "string",
