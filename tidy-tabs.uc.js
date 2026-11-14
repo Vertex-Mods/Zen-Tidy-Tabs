@@ -37,7 +37,7 @@
     AUTO_SORT_DEBOUNCE_MS: 1500, // Tabs that finish loading within this window share one embedding run
     AUTO_SORT_PENDING_TTL_MS: 60000, // Forget a new tab that hasn't loaded a real page by then
     AUTO_SORT_RETRY_MS: 2000, // Re-check interval while the broom sort is running
-    AUTO_SORT_MAX_BUSY_RETRIES: 10, // Then drop that batch instead of waiting forever
+    AUTO_SORT_MAX_BUSY_RETRIES: 10, // Past this many retries against a previous auto-sort batch, back off 3x (tabs stay queued, never dropped)
     AUTO_SORT_BROOM_WAIT_MS: 15000, // Max time a broom click waits for an in-flight batch
     AUTO_SORT_ARM_FALLBACK_MS: 10000, // Arm delay when SessionStore's restore promise is unavailable
     // A single new tab rarely clears GROUP_SIMILARITY_THRESHOLD against a mixed
@@ -51,7 +51,8 @@
     AUTO_SORT_MIN_SIMILARITY: 0.45,
     AUTO_SORT_MIN_MARGIN: 0.1,
     // --- Local LLM (Ollama, opt-in) ---
-    LLM_TIMEOUT_MS: 20000, // Per call; the first call also loads the model
+    LLM_TIMEOUT_MS: 20000, // Per call after the model is warm
+    LLM_FIRST_CALL_TIMEOUT_MS: 120000, // First successful call also loads the model into RAM; give it room
     LLM_MAX_TIMEOUT_MS: 60000, // Cap of the per-call timeout, which scales with tab count
     LLM_DOWN_RETRY_MS: 30000, // After a failure, skip the LLM (no network) for this long
   };
@@ -305,6 +306,7 @@
     Math.min(CONFIG.LLM_MAX_TIMEOUT_MS, 10000 + 400 * tabCount);
 
   let llmRemoteWarned = false;
+  let llmEverSucceeded = false; // first success also pays model load; allow a longer timeout until then
   const warnIfRemoteEndpoint = (endpoint) => {
     if (llmRemoteWarned) return;
     try {
@@ -331,8 +333,13 @@
   ) => {
     if (!getLlmEnabled()) return null;
     if (isLlmDownNow()) return null;
+    // First-ever call loads the model into RAM (seconds on spinning disk):
+    // don't let the warm-call timeout fail it and mark the LLM down.
+    const effectiveTimeout = llmEverSucceeded
+      ? timeoutMs
+      : Math.max(timeoutMs, CONFIG.LLM_FIRST_CALL_TIMEOUT_MS);
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const timer = setTimeout(() => controller.abort(), effectiveTimeout);
     try {
       const endpoint = getLlmEndpoint();
       warnIfRemoteEndpoint(endpoint);
@@ -361,6 +368,7 @@
         throw new Error("reply is not a JSON object");
       }
       llmDownUntil = 0;
+      llmEverSucceeded = true;
       return parsed;
     } catch (e) {
       const wasUp = !isLlmDownNow();
@@ -441,11 +449,13 @@
     });
 
   const LLM_NEW_GROUP_MAX = 24;
-  // Tabs per llmAssignTabs call (broom and auto-sort). One tab per call: 20-tab chunks
-  // dumped generic pages into groups (16 wrong of 60); single calls gave 2 wrong. The
-  // system prompt and groups block precede the tab text and are identical across
-  // calls, so Ollama reuses its prefix (KV) cache.
-  const LLM_ASSIGN_CHUNK = 1;
+  // Tabs per llmAssignTabs call (broom and auto-sort). 20-tab chunks dumped
+  // generic pages into groups (16 wrong of 60); 1-per-call gave 2 wrong but
+  // costs ~1s per tab (~60s for 60 tabs). 5 per call is the compromise: small
+  // enough that tabs are still judged on their own (generic pages stay out),
+  // 5x fewer round-trips. The system prompt and groups block precede the tab
+  // text and are identical across calls, so Ollama reuses its prefix (KV) cache.
+  const LLM_ASSIGN_CHUNK = 5;
   const LLM_NEWGROUP_CHUNK = 20; // auto-sort pass 2: loose tabs per llmClusterTabs call
   // One LLM call that files tabs into groups. `groups` is a Map label ->
   // { element?, tabTitles? }: existing groups only (callers pass real groups
@@ -460,16 +470,15 @@
       const byLower = new Map(labels.map((l) => [l.toLowerCase(), l]));
       const groupLines = llmGroupLines(groups);
       const tabLines = llmTabLines(tabs);
-      // Kept on purpose: the "new_group" field and the "null for both fields"
-      // wording stay so the prompt is byte-identical (prefix/KV-cache reuse,
-      // tested wording), even though callers only read "group".
+      // Existing groups only: new groups come from llmClusterTabs, never here.
+      // Each tab is judged on its own: neighbors in the same call must not
+      // rescue a generic page or a vague match into a group.
       const system =
         "You file browser tabs into tab groups. A tab left ungrouped is fine; a tab in the wrong group is not.\n" +
         "Rules:\n" +
         '- Set "group" to an existing group name when the tab is the same kind of content or topic as that group\'s tabs (for example another recipe for a recipes group, another pull request for a pull request group). Copy the name exactly. If the match is only vague or partial, use null.\n' +
-        "- Generic utility pages always get null for both fields: search engines, sign-in or account pages, email inboxes, maps, calendars, new tab pages, social media feeds, video homepages.\n" +
-        '- Always set "new_group" to null.\n' +
-        "- When unsure about a tab, use null for both. " +
+        "- Generic utility pages always get null: search engines, sign-in or account pages, email inboxes, maps, calendars, new tab pages, social media feeds, video homepages.\n" +
+        "- Judge each tab on its own; never assign a tab because other tabs in the same request share a topic. When unsure about a tab, use null. " +
         'Answer with JSON only: one assignment per tab, using the tab number as "i".';
       const user =
         `Existing groups:\n${groupLines.length ? groupLines.join("\n") : "(none)"}\n\n` +
@@ -484,9 +493,8 @@
               properties: {
                 i: { type: "integer" },
                 group: { type: ["string", "null"] },
-                new_group: { type: ["string", "null"] },
               },
-              required: ["i", "group", "new_group"],
+              required: ["i", "group"],
             },
           },
         },
@@ -5502,6 +5510,54 @@
             if (members.length < 2) continue;
             createGroup(wsId, name, members);
           }
+          // Singles never seed a group, but may join one just created above:
+          // try the same clear-winner embedding rule against the refreshed
+          // group set (existing + new). Tabs that match nothing stay loose.
+          if (!llmFailed && createNew && newByName.size > 0 && !shouldStop()) {
+            try {
+              const clustered = new Set();
+              for (const { tabs: groupTabs } of newByName.values()) {
+                for (const t of groupTabs) clustered.add(t);
+              }
+              const singles = loose.filter(
+                (t) => !clustered.has(t) && isAutoSortCandidate(t) && !t.closest("tab-group")
+              );
+              if (singles.length > 0) {
+                const freshGroups = collectWorkspaceGroups(wsId);
+                const singlesTexts = singles.map((tab) =>
+                  tabToEmbeddingText(getTabUrlSpec(tab), getTabTitle(tab) || "")
+                );
+                const singlesEmbeddings = await getEmbeddingsForTitles(singlesTexts);
+                if (!shouldStop()) {
+                  const freshEmbeddings = await embedWorkspaceGroups(freshGroups);
+                  if (!shouldStop()) {
+                    for (let k = 0; k < singles.length; k++) {
+                      const tab = singles[k];
+                      if (!singlesEmbeddings[k] || !isAutoSortCandidate(tab)) continue;
+                      const match = findAutoSortGroup(
+                        tab,
+                        getTabTitle(tab),
+                        singlesEmbeddings[k],
+                        freshGroups,
+                        freshEmbeddings
+                      );
+                      const groupEl = match ? freshGroups.get(match.groupName)?.element : null;
+                      if (groupEl?.isConnected) {
+                        moveToGroup(
+                          tab,
+                          groupEl,
+                          match.groupName,
+                          ` (similarity: ${match.similarity.toFixed(3)}, type: ${match.matchType}, joined new group)`
+                        );
+                      }
+                    }
+                  }
+                }
+              }
+            } catch (e) {
+              console.warn("[TabSort][Auto] LLM singleton attach failed:", e?.message || e);
+            }
+          }
           if (!llmFailed) {
             // Every tab of this batch had its one shot (incl. non-candidates).
             remaining.forEach((tab) => autoSortHandled.add(tab));
@@ -5565,11 +5621,16 @@
           continue;
         }
 
-        // Unlike the broom sort, single-tab clusters also get a group here.
+        // New groups need 2+ tabs: singletons never seed a group on their
+        // own. After the multi-tab groups are created, leftover singletons
+        // get one chance to join a just-created group (same clear-winner
+        // rule), so a single tab can still land in a new group made by its
+        // batch-mates. Anything still unmatched stays loose.
         const clusters = clusterEmbeddings(
           unmatchedEmbeddings,
           CONFIG.SIMILARITY_THRESHOLD
         );
+        const singleIdxs = [];
         for (const cluster of clusters) {
           if (shouldStop() || !getAutoSortCreateGroupsEnabled()) break;
           const members = cluster.filter((idx) =>
@@ -5577,6 +5638,10 @@
           );
           const clusterTabs = members.map((idx) => unmatchedTabs[idx]);
           if (clusterTabs.length === 0) continue;
+          if (clusterTabs.length < 2) {
+            singleIdxs.push(...members);
+            continue;
+          }
           const clusterTitles = clusterTabs.map((tab) => getTabTitle(tab));
           const label = await nameGroupWithSmartTabTopic(
             clusterTitles,
@@ -5588,6 +5653,41 @@
           // Naming is async: re-validate before touching the DOM.
           if (shouldStop()) break;
           createGroup(wsId, label, clusterTabs.filter(isAutoSortCandidate));
+        }
+        // Singletons join just-created groups (or stay loose): never seed one.
+        if (singleIdxs.length > 0 && !shouldStop() && getAutoSortCreateGroupsEnabled()) {
+          try {
+            const freshGroups = collectWorkspaceGroups(wsId);
+            const freshEmbeddings = await embedWorkspaceGroups(freshGroups);
+            if (!shouldStop()) {
+              for (const idx of singleIdxs) {
+                const tab = unmatchedTabs[idx];
+                if (!isAutoSortCandidate(tab)) continue;
+                const match = findAutoSortGroup(
+                  tab,
+                  getTabTitle(tab),
+                  unmatchedEmbeddings[idx],
+                  freshGroups,
+                  freshEmbeddings
+                );
+                const groupEl = match ? freshGroups.get(match.groupName)?.element : null;
+                if (groupEl?.isConnected) {
+                  moveToGroup(
+                    tab,
+                    groupEl,
+                    match.groupName,
+                    ` (similarity: ${match.similarity.toFixed(3)}, type: ${match.matchType}, joined new group)`
+                  );
+                } else {
+                  console.log(
+                    `[TabSort][Auto] "${getTabTitle(tab)}" matches no group (singleton, no new group seeded), leaving ungrouped`
+                  );
+                }
+              }
+            }
+          } catch (e) {
+            console.warn("[TabSort][Auto] Singleton attach to new groups failed:", e?.message || e);
+          }
         }
       }
 
@@ -5624,19 +5724,21 @@
         return;
       }
       if (autoSortReady.size === 0) return;
-      // Broom sort (or a previous batch) owns the tabs right now: retry
-      // shortly, but not forever.
+      // Broom sort (or a previous batch) owns the tabs right now: back off
+      // and retry. Tabs are never dropped here: they stay queued in
+      // autoSortReady until the in-flight sort settles. Concurrency is
+      // unchanged (never two sorts at once); only the loss is fixed.
+      // A broom sort (possibly a slow LLM one) does not use up the budget.
       if (isSorting || autoSortPromise) {
-        // A broom sort (possibly a slow LLM one) does not use up the budget.
-        if (!isSorting && ++autoSortBusyRetries > CONFIG.AUTO_SORT_MAX_BUSY_RETRIES) {
-          console.warn(
-            `[TabSort][Auto] Still busy after ${CONFIG.AUTO_SORT_MAX_BUSY_RETRIES} retries, dropping ${autoSortReady.size} tab(s)`
-          );
-          autoSortReady.clear();
-          autoSortBusyRetries = 0;
-          return;
-        }
-        scheduleAutoSortBatch(CONFIG.AUTO_SORT_RETRY_MS);
+        // Previous auto-sort batch still running: keep waiting with backoff
+        // instead of dropping. autoSortPromise always settles (run.finally
+        // clears it), so this cannot wait forever.
+        if (!isSorting) autoSortBusyRetries++;
+        const backoff =
+          autoSortBusyRetries > CONFIG.AUTO_SORT_MAX_BUSY_RETRIES
+            ? CONFIG.AUTO_SORT_RETRY_MS * 3
+            : CONFIG.AUTO_SORT_RETRY_MS;
+        scheduleAutoSortBatch(backoff);
         return;
       }
       autoSortBusyRetries = 0;
